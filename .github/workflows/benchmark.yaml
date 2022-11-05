@@ -32,7 +32,7 @@ jobs:
         with:
           name: Go Benchmark
           tool: 'go'
-          output-file-path: benchmark/new.out
+          output-file-path: benchmarks/new.out
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
           # Show alert with commit comment on detecting possible performance regression
