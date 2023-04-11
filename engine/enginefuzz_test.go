@@ -27,6 +27,25 @@ import (
 	"github.com/thanos-community/promql-engine/logicalplan"
 )
 
+const testRuns = 100
+
+type testCase struct {
+	query      string
+	res1, res2 *promql.Result
+}
+
+func promqlFunctions() []*parser.Function {
+	res := make([]*parser.Function, 0, len(parser.Functions))
+	for name, f := range parser.Functions {
+		// Ignore timestamp, which is not supported by the engine.
+		if name == "timestamp" {
+			continue
+		}
+		res = append(res, f)
+	}
+	return res
+}
+
 func FuzzEnginePromQLSmithRangeQuery(f *testing.F) {
 	f.Add(uint32(0), uint32(120), uint32(30), 1.0, 1.0, 1.0, 2.0, 30)
 
@@ -68,44 +87,64 @@ func FuzzEnginePromQLSmithRangeQuery(f *testing.F) {
 		psOpts := []promqlsmith.Option{
 			promqlsmith.WithEnableOffset(true),
 			promqlsmith.WithEnableAtModifier(true),
+			promqlsmith.WithEnabledFunctions(promqlFunctions()),
 		}
 		ps := promqlsmith.New(rnd, seriesSet, psOpts...)
 
 		newEngine := engine.New(engine.Opts{EngineOpts: opts, DisableFallback: true})
+		oldEngine := promql.NewEngine(opts)
 
 		var (
 			q1    promql.Query
 			query string
 		)
-		// Since we disabled fallback, keep trying until we find a query
-		// that can be natively executed by the engine.
-		for {
-			expr := ps.WalkRangeQuery()
-			query = expr.Pretty(0)
-			q1, err = newEngine.NewRangeQuery(test.Storage(), nil, query, start, end, interval)
-			if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
-				continue
-			} else {
-				break
+		cases := make([]*testCase, testRuns)
+		for i := 0; i < testRuns; i++ {
+			// Since we disabled fallback, keep trying until we find a query
+			// that can be natively executed by the engine.
+			for {
+				expr := ps.WalkRangeQuery()
+				query = expr.Pretty(0)
+				q1, err = newEngine.NewRangeQuery(test.Storage(), nil, query, start, end, interval)
+				if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
+					continue
+				} else {
+					break
+				}
+			}
+
+			testutil.Ok(t, err)
+			newResult := q1.Exec(context.Background())
+
+			q2, err := oldEngine.NewRangeQuery(test.Storage(), nil, query, start, end, interval)
+			testutil.Ok(t, err)
+
+			oldResult := q2.Exec(context.Background())
+
+			cases[i] = &testCase{
+				query: query,
+				res1:  newResult,
+				res2:  oldResult,
 			}
 		}
-
-		testutil.Ok(t, err)
-		t.Log(query)
-		newResult := q1.Exec(context.Background())
-		testutil.Ok(t, newResult.Err)
-
-		oldEngine := promql.NewEngine(opts)
-		q2, err := oldEngine.NewRangeQuery(test.Storage(), nil, query, start, end, interval)
-		testutil.Ok(t, err)
-
-		oldResult := q2.Exec(context.Background())
-		testutil.Ok(t, oldResult.Err)
-
-		emptyLabelsToNil(newResult)
-		emptyLabelsToNil(oldResult)
-		testutil.WithGoCmp(comparer).Equals(t, oldResult, newResult, query)
+		validateTestCases(t, cases)
 	})
+}
+
+func validateTestCases(t *testing.T, cases []*testCase) {
+	failures := 0
+	for i, c := range cases {
+		emptyLabelsToNil(c.res1)
+		emptyLabelsToNil(c.res2)
+
+		if !cmp.Equal(c.res1, c.res2, comparer) {
+			t.Logf("case %d error mismatch.\n%s\nres1: %s\nres2: %s\n", i, c.query, c.res1.String(), c.res2.String())
+			failures = 0
+		}
+	}
+	if failures > 0 {
+		require.Fail(t, "failed %d test cases", failures)
+	}
 }
 
 func FuzzEnginePromQLSmithInstantQuery(f *testing.F) {
@@ -137,6 +176,7 @@ func FuzzEnginePromQLSmithInstantQuery(f *testing.F) {
 			DisableFallback:   true,
 			LogicalOptimizers: logicalplan.AllOptimizers,
 		})
+		oldEngine := promql.NewEngine(opts)
 
 		seriesSet, err := getSeries(context.Background(), test.Storage())
 		require.NoError(t, err)
@@ -144,6 +184,7 @@ func FuzzEnginePromQLSmithInstantQuery(f *testing.F) {
 		psOpts := []promqlsmith.Option{
 			promqlsmith.WithEnableOffset(true),
 			promqlsmith.WithEnableAtModifier(true),
+			promqlsmith.WithEnabledFunctions(promqlFunctions()),
 		}
 		ps := promqlsmith.New(rnd, seriesSet, psOpts...)
 
@@ -151,34 +192,36 @@ func FuzzEnginePromQLSmithInstantQuery(f *testing.F) {
 			q1    promql.Query
 			query string
 		)
-		// Since we disabled fallback, keep trying until we find a query
-		// that can be natively execute by the engine.
-		for {
-			expr := ps.WalkInstantQuery()
-			query = expr.Pretty(0)
-			q1, err = newEngine.NewInstantQuery(test.Storage(), nil, query, queryTime)
-			if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
-				continue
-			} else {
-				break
+		cases := make([]*testCase, testRuns)
+		for i := 0; i < testRuns; i++ {
+			// Since we disabled fallback, keep trying until we find a query
+			// that can be natively execute by the engine.
+			for {
+				expr := ps.WalkInstantQuery()
+				query = expr.Pretty(0)
+				q1, err = newEngine.NewInstantQuery(test.Storage(), nil, query, queryTime)
+				if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
+					continue
+				} else {
+					break
+				}
+			}
+
+			testutil.Ok(t, err)
+			newResult := q1.Exec(context.Background())
+
+			q2, err := oldEngine.NewInstantQuery(test.Storage(), nil, query, queryTime)
+			testutil.Ok(t, err)
+
+			oldResult := q2.Exec(context.Background())
+
+			cases[i] = &testCase{
+				query: query,
+				res1:  newResult,
+				res2:  oldResult,
 			}
 		}
-
-		testutil.Ok(t, err)
-		t.Log(query)
-		newResult := q1.Exec(context.Background())
-		testutil.Ok(t, newResult.Err)
-
-		oldEngine := promql.NewEngine(opts)
-		q2, err := oldEngine.NewInstantQuery(test.Storage(), nil, query, queryTime)
-		testutil.Ok(t, err)
-
-		oldResult := q2.Exec(context.Background())
-		testutil.Ok(t, oldResult.Err)
-
-		emptyLabelsToNil(newResult)
-		emptyLabelsToNil(oldResult)
-		testutil.WithGoCmp(comparer).Equals(t, oldResult, newResult, query)
+		validateTestCases(t, cases)
 	})
 }
 
@@ -247,6 +290,7 @@ func FuzzDistributedEnginePromQLSmithRangeQuery(f *testing.F) {
 			remoteEngines = append(remoteEngines, e)
 		}
 		distEngine := engine.NewDistributedEngine(engineOpts, api.NewStaticEndpoints(remoteEngines))
+		oldEngine := promql.NewEngine(opts)
 
 		mergeStore := storage.NewFanout(nil, test.Storage(), test2.Storage())
 		seriesSet, err := getSeries(context.Background(), mergeStore)
@@ -256,6 +300,7 @@ func FuzzDistributedEnginePromQLSmithRangeQuery(f *testing.F) {
 			promqlsmith.WithEnableOffset(true),
 			promqlsmith.WithEnableAtModifier(true),
 			promqlsmith.WithEnabledAggrs([]parser.ItemType{parser.SUM, parser.MIN, parser.MAX, parser.GROUP, parser.COUNT, parser.BOTTOMK, parser.TOPK}),
+			promqlsmith.WithEnabledFunctions(promqlFunctions()),
 		}
 		ps := promqlsmith.New(rnd, seriesSet, psOpts...)
 
@@ -263,34 +308,36 @@ func FuzzDistributedEnginePromQLSmithRangeQuery(f *testing.F) {
 			q1    promql.Query
 			query string
 		)
-		// Since we disabled fallback, keep trying until we find a query
-		// that can be natively execute by the engine.
-		for {
-			expr := ps.WalkRangeQuery()
-			query = expr.Pretty(0)
-			q1, err = distEngine.NewRangeQuery(mergeStore, nil, query, start, end, interval)
-			if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
-				continue
-			} else {
-				break
+		cases := make([]*testCase, testRuns)
+		for i := 0; i < testRuns; i++ {
+			// Since we disabled fallback, keep trying until we find a query
+			// that can be natively execute by the engine.
+			for {
+				expr := ps.WalkRangeQuery()
+				query = expr.Pretty(0)
+				q1, err = distEngine.NewRangeQuery(mergeStore, nil, query, start, end, interval)
+				if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
+					continue
+				} else {
+					break
+				}
+			}
+
+			testutil.Ok(t, err)
+			newResult := q1.Exec(context.Background())
+
+			q2, err := oldEngine.NewRangeQuery(mergeStore, nil, query, start, end, interval)
+			testutil.Ok(t, err)
+
+			oldResult := q2.Exec(context.Background())
+
+			cases[i] = &testCase{
+				query: query,
+				res1:  newResult,
+				res2:  oldResult,
 			}
 		}
-
-		testutil.Ok(t, err)
-		t.Log(query)
-		newResult := q1.Exec(context.Background())
-		testutil.Ok(t, newResult.Err)
-
-		oldEngine := promql.NewEngine(opts)
-		q2, err := oldEngine.NewRangeQuery(mergeStore, nil, query, start, end, interval)
-		testutil.Ok(t, err)
-
-		oldResult := q2.Exec(context.Background())
-		testutil.Ok(t, oldResult.Err)
-
-		emptyLabelsToNil(newResult)
-		emptyLabelsToNil(oldResult)
-		testutil.WithGoCmp(comparer).Equals(t, oldResult, newResult, query)
+		validateTestCases(t, cases)
 	})
 }
 
@@ -346,6 +393,7 @@ func FuzzDistributedEnginePromQLSmithInstantQuery(f *testing.F) {
 			remoteEngines = append(remoteEngines, e)
 		}
 		distEngine := engine.NewDistributedEngine(engineOpts, api.NewStaticEndpoints(remoteEngines))
+		oldEngine := promql.NewEngine(opts)
 
 		mergeStore := storage.NewFanout(nil, test.Storage(), test2.Storage())
 		seriesSet, err := getSeries(context.Background(), mergeStore)
@@ -355,6 +403,7 @@ func FuzzDistributedEnginePromQLSmithInstantQuery(f *testing.F) {
 			promqlsmith.WithEnableOffset(true),
 			promqlsmith.WithEnableAtModifier(true),
 			promqlsmith.WithEnabledAggrs([]parser.ItemType{parser.SUM, parser.MIN, parser.MAX, parser.GROUP, parser.COUNT, parser.BOTTOMK, parser.TOPK}),
+			promqlsmith.WithEnabledFunctions(promqlFunctions()),
 		}
 		ps := promqlsmith.New(rnd, seriesSet, psOpts...)
 
@@ -362,34 +411,36 @@ func FuzzDistributedEnginePromQLSmithInstantQuery(f *testing.F) {
 			q1    promql.Query
 			query string
 		)
-		// Since we disabled fallback, keep trying until we find a query
-		// that can be natively execute by the engine.
-		for {
-			expr := ps.Walk(parser.ValueTypeVector, parser.ValueTypeMatrix)
-			query = expr.Pretty(0)
-			q1, err = distEngine.NewInstantQuery(mergeStore, nil, query, queryTime)
-			if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
-				continue
-			} else {
-				break
+		cases := make([]*testCase, testRuns)
+		for i := 0; i < testRuns; i++ {
+			// Since we disabled fallback, keep trying until we find a query
+			// that can be natively execute by the engine.
+			for {
+				expr := ps.Walk(parser.ValueTypeVector, parser.ValueTypeMatrix)
+				query = expr.Pretty(0)
+				q1, err = distEngine.NewInstantQuery(mergeStore, nil, query, queryTime)
+				if errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented) {
+					continue
+				} else {
+					break
+				}
+			}
+
+			testutil.Ok(t, err)
+			newResult := q1.Exec(context.Background())
+
+			q2, err := oldEngine.NewInstantQuery(mergeStore, nil, query, queryTime)
+			testutil.Ok(t, err)
+
+			oldResult := q2.Exec(context.Background())
+
+			cases[i] = &testCase{
+				query: query,
+				res1:  newResult,
+				res2:  oldResult,
 			}
 		}
-
-		testutil.Ok(t, err)
-		t.Log(query)
-		newResult := q1.Exec(context.Background())
-		testutil.Ok(t, newResult.Err)
-
-		oldEngine := promql.NewEngine(opts)
-		q2, err := oldEngine.NewInstantQuery(mergeStore, nil, query, queryTime)
-		testutil.Ok(t, err)
-
-		oldResult := q2.Exec(context.Background())
-		testutil.Ok(t, oldResult.Err)
-
-		emptyLabelsToNil(newResult)
-		emptyLabelsToNil(oldResult)
-		testutil.WithGoCmp(comparer).Equals(t, oldResult, newResult, query)
+		validateTestCases(t, cases)
 	})
 }
 
