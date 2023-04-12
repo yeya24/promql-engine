@@ -128,10 +128,6 @@ type distributedEngine struct {
 }
 
 func NewDistributedEngine(opts Opts, endpoints api.RemoteEndpoints) v1.QueryEngine {
-	opts.LogicalOptimizers = []logicalplan.Optimizer{
-		logicalplan.DistributedExecutionOptimizer{Endpoints: endpoints},
-	}
-
 	return &distributedEngine{
 		endpoints:    endpoints,
 		remoteEngine: New(opts),
@@ -256,6 +252,7 @@ func (e *compatibilityEngine) NewInstantQuery(q storage.Queryable, opts *promql.
 	resultSort := newResultSort(expr)
 
 	lplan := logicalplan.New(expr, &logicalplan.Opts{
+		Query:         qs,
 		Start:         ts,
 		End:           ts,
 		Step:          1,
@@ -307,6 +304,7 @@ func (e *compatibilityEngine) NewRangeQuery(q storage.Queryable, opts *promql.Qu
 	}
 
 	lplan := logicalplan.New(expr, &logicalplan.Opts{
+		Query:         qs,
 		Start:         start,
 		End:           end,
 		Step:          step,
