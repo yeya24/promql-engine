@@ -84,3 +84,5 @@ exclude (
 	cloud.google.com/go v0.34.0
 	cloud.google.com/go v0.65.0
 )
+
+replace github.com/prometheus/prometheus => github.com/yeya24/prometheus v1.8.2-0.20230417051106-e865cf991499
