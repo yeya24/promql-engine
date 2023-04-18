@@ -329,3 +329,19 @@ func isNumberLiteral(expr parser.Expr) bool {
 
 	return isNumberLiteral(stepInvariant.Expr)
 }
+
+type Coalesce struct {
+	Expressions RemoteExecutions
+}
+
+func (r Coalesce) String() string {
+	return fmt.Sprintf("coalesce(%s)", r.Expressions.String())
+}
+
+func (r Coalesce) Pretty(level int) string { return r.String() }
+
+func (r Coalesce) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+
+func (r Coalesce) Type() parser.ValueType { return parser.ValueTypeMatrix }
+
+func (r Coalesce) PromQLExpr() {}

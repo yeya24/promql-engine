@@ -262,6 +262,17 @@ func newOperator(expr parser.Expr, storage *engstore.SelectorPool, opts *query.O
 		dedup := exchange.NewDedupOperator(model.NewVectorPool(stepsBatch), coalesce)
 		return exchange.NewConcurrent(dedup, 2), nil
 
+	case logicalplan.Coalesce:
+		operators := make([]model.VectorOperator, len(e.Expressions))
+		for i, expr := range e.Expressions {
+			operator, err := newOperator(expr, storage, opts, hints)
+			if err != nil {
+				return nil, err
+			}
+			operators[i] = operator
+		}
+		return exchange.NewCoalesce(model.NewVectorPool(stepsBatch), operators...), nil
+
 	case logicalplan.RemoteExecution:
 		// Create a new remote query scoped to the calculated start time.
 		qry, err := e.Engine.NewRangeQuery(&promql.QueryOpts{LookbackDelta: opts.LookbackDelta}, e.Query, e.QueryRangeStart, opts.End, opts.Step)
