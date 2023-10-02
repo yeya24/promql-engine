@@ -5,7 +5,7 @@ package engine
 
 import (
 	"context"
-
+	"github.com/prometheus/prometheus/util/annotations"
 	"io"
 	"math"
 	"runtime"
@@ -699,7 +699,7 @@ loop:
 
 func newErrResult(r *promql.Result, err error) *promql.Result {
 	if r == nil {
-		r = &promql.Result{}
+		r = &promql.Result{Warnings: annotations.Annotations(nil)}
 	}
 	if r.Err == nil && err != nil {
 		r.Err = err

@@ -523,12 +523,12 @@ var comparer = cmp.Comparer(func(x, y *promql.Result) bool {
 })
 
 func getSeries(ctx context.Context, q storage.Queryable) ([]labels.Labels, error) {
-	querier, err := q.Querier(ctx, 0, time.Now().Unix())
+	querier, err := q.Querier(0, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
 	res := make([]labels.Labels, 0)
-	ss := querier.Select(false, &storage.SelectHints{Func: "series"}, labels.MustNewMatcher(labels.MatchEqual, "__name__", "http_requests_total"))
+	ss := querier.Select(ctx, false, &storage.SelectHints{Func: "series"}, labels.MustNewMatcher(labels.MatchEqual, "__name__", "http_requests_total"))
 	for ss.Next() {
 		lbls := ss.At().Labels()
 		res = append(res, lbls)

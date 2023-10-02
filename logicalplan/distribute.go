@@ -5,6 +5,7 @@ package logicalplan
 
 import (
 	"fmt"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"math"
 	"sort"
 	"strings"
@@ -87,7 +88,7 @@ func (r RemoteExecution) String() string {
 
 func (r RemoteExecution) Pretty(level int) string { return r.String() }
 
-func (r RemoteExecution) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+func (r RemoteExecution) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
 
 func (r RemoteExecution) Type() parser.ValueType { return parser.ValueTypeMatrix }
 
@@ -104,7 +105,7 @@ func (r Deduplicate) String() string {
 
 func (r Deduplicate) Pretty(level int) string { return r.String() }
 
-func (r Deduplicate) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+func (r Deduplicate) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
 
 func (r Deduplicate) Type() parser.ValueType { return parser.ValueTypeMatrix }
 
@@ -116,7 +117,7 @@ func (r Noop) String() string { return "noop" }
 
 func (r Noop) Pretty(level int) string { return r.String() }
 
-func (r Noop) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+func (r Noop) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
 
 func (r Noop) Type() parser.ValueType { return parser.ValueTypeMatrix }
 

@@ -6,6 +6,7 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"github.com/prometheus/prometheus/util/annotations"
 	"math"
 	"os"
 	"reflect"
@@ -1924,7 +1925,9 @@ func TestQueriesAgainstOldEngine(t *testing.T) {
 									return
 								}
 
-								testutil.Equals(t, newResult.Warnings, oldResult.Warnings)
+								emptyWarningsToNil(oldResult)
+								emptyWarningsToNil(newResult)
+								testutil.Equals(t, oldResult.Warnings, newResult.Warnings)
 								testutil.Ok(t, newResult.Err)
 								if hasNaNs(oldResult) {
 									t.Log("Applying comparison with NaN equality.")
@@ -2020,7 +2023,7 @@ func TestWarnings(t *testing.T) {
 	querier := &storage.MockQueryable{
 		MockQuerier: &storage.MockQuerier{
 			SelectMockFunction: func(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
-				return newWarningsSeriesSet(storage.Warnings{errors.New("test warning")})
+				return newWarningsSeriesSet(annotations.New().Add(errors.New("test warning")))
 			},
 		},
 	}
@@ -2034,19 +2037,17 @@ func TestWarnings(t *testing.T) {
 	cases := []struct {
 		name          string
 		query         string
-		expectedWarns storage.Warnings
+		expectedWarns []error
 	}{
 		{
-			name:  "single select call",
-			query: "http_requests_total",
-			expectedWarns: storage.Warnings{
-				errors.New("test warning"),
-			},
+			name:          "single select call",
+			query:         "http_requests_total",
+			expectedWarns: []error{errors.New("test warning")},
 		},
 		{
 			name:  "multiple select calls",
 			query: `sum(http_requests_total) / sum(http_responses_total)`,
-			expectedWarns: storage.Warnings{
+			expectedWarns: []error{
 				errors.New("test warning"),
 				errors.New("test warning"),
 			},
@@ -2061,9 +2062,13 @@ func TestWarnings(t *testing.T) {
 
 			res := q1.Exec(context.Background())
 			testutil.Ok(t, res.Err)
+			expectedWarns := annotations.New()
+			for _, warn := range tc.expectedWarns {
+				expectedWarns.Add(warn)
+			}
 			testutil.WithGoCmp(cmp.Comparer(func(err1, err2 error) bool {
 				return err1.Error() == err2.Error()
-			})).Equals(t, tc.expectedWarns, res.Warnings)
+			})).Equals(t, expectedWarns, res.Warnings)
 		})
 	}
 }
@@ -2135,6 +2140,8 @@ func TestEdgeCases(t *testing.T) {
 			oldResult := q1.Exec(ctx)
 			newResult := q2.Exec(ctx)
 
+			emptyWarningsToNil(oldResult)
+			emptyWarningsToNil(newResult)
 			testutil.Equals(t, oldResult, newResult)
 		})
 	}
@@ -2997,7 +3004,7 @@ func TestInstantQuery(t *testing.T) {
 				       http_requests_total{pod="nginx-4", series="3"} 5+2.4x50
 				       http_requests_total{pod="nginx-5", series="1"} 8.4+2.3x50
 				       http_requests_total{pod="nginx-6", series="2"} 2.3+2.3x50`,
-			query: "quantile by (pod) (scalar(min(http_requests_total)), rate(http_requests_total[1m]))",
+			query: "quantile by (pod) (0. 1 * scalar(min(http_requests_total)), rate(http_requests_total[1m]))",
 		},
 		{
 			name: "quantile",
@@ -3829,6 +3836,8 @@ func TestInstantQuery(t *testing.T) {
 									sortByLabels(newResult)
 								}
 
+								emptyWarningsToNil(oldResult)
+								emptyWarningsToNil(newResult)
 								if hasNaNs(oldResult) {
 									t.Log("Applying comparison with NaN equality.")
 									equalsWithNaNs(t, oldResult, newResult)
@@ -3910,7 +3919,7 @@ type hintRecordingQuerier struct {
 
 func (h *hintRecordingQuerier) Close() error { return nil }
 
-func (h *hintRecordingQuerier) Select(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+func (h *hintRecordingQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	h.mux.Lock()
 	defer h.mux.Unlock()
 	h.hints = append(h.hints, hints)
@@ -4423,7 +4432,7 @@ func (m *mockIterator) Err() error { return nil }
 type testSeriesSet struct {
 	i      int
 	series []storage.Series
-	warns  storage.Warnings
+	warns  annotations.Annotations
 }
 
 func newTestSeriesSet(series ...storage.Series) storage.SeriesSet {
@@ -4433,17 +4442,17 @@ func newTestSeriesSet(series ...storage.Series) storage.SeriesSet {
 	}
 }
 
-func newWarningsSeriesSet(warns storage.Warnings) storage.SeriesSet {
+func newWarningsSeriesSet(warns annotations.Annotations) storage.SeriesSet {
 	return &testSeriesSet{
 		i:     -1,
 		warns: warns,
 	}
 }
 
-func (s *testSeriesSet) Next() bool                 { s.i++; return s.i < len(s.series) }
-func (s *testSeriesSet) At() storage.Series         { return s.series[s.i] }
-func (s *testSeriesSet) Err() error                 { return nil }
-func (s *testSeriesSet) Warnings() storage.Warnings { return s.warns }
+func (s *testSeriesSet) Next() bool                        { s.i++; return s.i < len(s.series) }
+func (s *testSeriesSet) At() storage.Series                { return s.series[s.i] }
+func (s *testSeriesSet) Err() error                        { return nil }
+func (s *testSeriesSet) Warnings() annotations.Annotations { return s.warns }
 
 type slowSeries struct{}
 
@@ -4920,5 +4929,13 @@ func emptyLabelsToNil(result *promql.Result) {
 				result.Value.(promql.Matrix)[i].Metric = labels.EmptyLabels()
 			}
 		}
+	}
+}
+
+// emptyWarningsToNil converts empty warnings to nil to work around inconsistencies in the
+// old promql engine.
+func emptyWarningsToNil(result *promql.Result) {
+	if len(result.Warnings) == 0 {
+		result.Warnings = nil
 	}
 }

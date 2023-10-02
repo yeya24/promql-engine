@@ -2,9 +2,8 @@ package warnings
 
 import (
 	"context"
+	"github.com/prometheus/prometheus/util/annotations"
 	"sync"
-
-	"github.com/prometheus/prometheus/storage"
 )
 
 type warningKey string
@@ -13,22 +12,22 @@ const key warningKey = "promql-warnings"
 
 type warnings struct {
 	mu    sync.Mutex
-	warns storage.Warnings
+	warns annotations.Annotations
 }
 
 func newWarnings() *warnings {
 	return &warnings{
-		warns: make(storage.Warnings, 0),
+		warns: make(annotations.Annotations),
 	}
 }
 
-func (w *warnings) add(warns storage.Warnings) {
+func (w *warnings) add(warns annotations.Annotations) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.warns = append(w.warns, warns...)
+	w.warns.Merge(warns)
 }
 
-func (w *warnings) get() storage.Warnings {
+func (w *warnings) get() annotations.Annotations {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.warns
@@ -38,7 +37,7 @@ func NewContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, key, newWarnings())
 }
 
-func AddToContext(warns storage.Warnings, ctx context.Context) {
+func AddToContext(warns annotations.Annotations, ctx context.Context) {
 	if len(warns) == 0 {
 		return
 	}
@@ -49,6 +48,6 @@ func AddToContext(warns storage.Warnings, ctx context.Context) {
 	w.add(warns)
 }
 
-func FromContext(ctx context.Context) storage.Warnings {
+func FromContext(ctx context.Context) annotations.Annotations {
 	return ctx.Value(key).(*warnings).get()
 }

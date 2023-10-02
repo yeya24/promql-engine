@@ -6,6 +6,7 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"github.com/prometheus/prometheus/util/annotations"
 	"math"
 	"testing"
 	"time"
@@ -70,11 +71,12 @@ func TestDistributedAggregations(t *testing.T) {
 	rangeStep := time.Second * 30
 
 	makeSeries := func(zone, pod string) []string {
-		return []string{labels.MetricName, "bar", "zone", zone, "pod", pod}
+		return []string{labels.MetricName, "bar_total", "zone", zone, "pod", pod}
 	}
 
+	// _total suffix will be added to suppress warnings.
 	makeSeriesWithName := func(name, zone, pod string) []string {
-		return []string{labels.MetricName, name, "zone", zone, "pod", pod}
+		return []string{labels.MetricName, name + "_total", "zone", zone, "pod", pod}
 	}
 
 	tests := []struct {
@@ -296,6 +298,8 @@ func TestDistributedAggregations(t *testing.T) {
 											sortByLabels(promResult)
 											sortByLabels(distResult)
 
+											emptyWarningsToNil(promResult)
+											emptyWarningsToNil(distResult)
 											testutil.Equals(t, promResult, distResult)
 										})
 									}
@@ -318,6 +322,8 @@ func TestDistributedAggregations(t *testing.T) {
 
 										roundValues(promResult)
 										roundValues(distResult)
+										emptyWarningsToNil(promResult)
+										emptyWarningsToNil(distResult)
 										testutil.Equals(t, promResult, distResult)
 									})
 								})
@@ -334,7 +340,7 @@ func TestDistributedEngineWarnings(t *testing.T) {
 	querier := &storage.MockQueryable{
 		MockQuerier: &storage.MockQuerier{
 			SelectMockFunction: func(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
-				return newWarningsSeriesSet(storage.Warnings{errors.New("test warning")})
+				return newWarningsSeriesSet(annotations.New().Add(errors.New("test warning")))
 			},
 		},
 	}

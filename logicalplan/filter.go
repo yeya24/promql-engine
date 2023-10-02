@@ -5,6 +5,7 @@ package logicalplan
 
 import (
 	"fmt"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
 
 	"github.com/prometheus/prometheus/model/labels"
 
@@ -22,7 +23,7 @@ func (f FilteredSelector) String() string {
 
 func (f FilteredSelector) Pretty(level int) string { return f.String() }
 
-func (f FilteredSelector) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+func (f FilteredSelector) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
 
 func (f FilteredSelector) Type() parser.ValueType { return parser.ValueTypeVector }
 

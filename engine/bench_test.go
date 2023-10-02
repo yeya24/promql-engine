@@ -30,18 +30,19 @@ func BenchmarkChunkDecoding(b *testing.B) {
 	end := start.Add(6 * time.Hour)
 	step := time.Second * 30
 
-	querier, err := storage.Querier(context.Background(), start.UnixMilli(), end.UnixMilli())
+	querier, err := storage.Querier(start.UnixMilli(), end.UnixMilli())
 	testutil.Ok(b, err)
 
 	matcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total")
 	testutil.Ok(b, err)
+	ctx := context.TODO()
 
 	b.Run("iterate by series", func(b *testing.B) {
 		b.ResetTimer()
 		for c := 0; c < b.N; c++ {
 			numIterations := 0
 
-			ss := querier.Select(false, nil, matcher)
+			ss := querier.Select(ctx, false, nil, matcher)
 			series := make([]chunkenc.Iterator, 0)
 			for ss.Next() {
 				series = append(series, ss.At().Iterator(nil))
@@ -60,7 +61,7 @@ func BenchmarkChunkDecoding(b *testing.B) {
 		b.ResetTimer()
 		for c := 0; c < b.N; c++ {
 			numIterations := 0
-			ss := querier.Select(false, nil, matcher)
+			ss := querier.Select(ctx, false, nil, matcher)
 			series := make([]chunkenc.Iterator, 0)
 			for ss.Next() {
 				series = append(series, ss.At().Iterator(nil))
