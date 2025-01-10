@@ -27,12 +27,12 @@ var closedParenthesis = regexp.MustCompile(`\s+\)`)
 // internal logical expression types. Implementations were largeley taken
 // from upstream prometheus.
 //
-// TODO: maybe its better to traverse the expression here and inject
+// TODO: maybe its better to Traverse the expression here and inject
 // new nodes with prepared String methods? Like replacing MatrixSelector
 // by testMatrixSelector that has a overridden string method?
-func renderExprTree(expr parser.Expr) string {
+func renderExprTree(expr Node) string {
 	switch t := expr.(type) {
-	case *parser.NumberLiteral:
+	case *NumberLiteral:
 		return fmt.Sprint(t.Val)
 	case *VectorSelector:
 		var b strings.Builder
@@ -51,7 +51,7 @@ func renderExprTree(expr parser.Expr) string {
 		return base
 	case *MatrixSelector:
 		return t.String()
-	case *parser.BinaryExpr:
+	case *Binary:
 		var b strings.Builder
 		b.WriteString(renderExprTree(t.LHS))
 		b.WriteString(" ")
@@ -76,7 +76,7 @@ func renderExprTree(expr parser.Expr) string {
 		}
 		b.WriteString(renderExprTree(t.RHS))
 		return b.String()
-	case *parser.Call:
+	case *FunctionCall:
 		var b strings.Builder
 		b.Write([]byte(t.Func.Name))
 		b.WriteRune('(')
@@ -88,7 +88,7 @@ func renderExprTree(expr parser.Expr) string {
 		}
 		b.WriteRune(')')
 		return b.String()
-	case *parser.AggregateExpr:
+	case *Aggregation:
 		var b strings.Builder
 		b.Write([]byte(t.Op.String()))
 		switch {
@@ -105,7 +105,9 @@ func renderExprTree(expr parser.Expr) string {
 		b.WriteString(renderExprTree(t.Expr))
 		b.WriteRune(')')
 		return b.String()
-	case *parser.StepInvariantExpr:
+	case *StepInvariantExpr:
+		return renderExprTree(t.Expr)
+	case *CheckDuplicateLabels:
 		return renderExprTree(t.Expr)
 	default:
 		return t.String()
@@ -180,10 +182,10 @@ func TestDefaultOptimizers(t *testing.T) {
 			expr, err := parser.ParseExpr(tcase.expr)
 			testutil.Ok(t, err)
 
-			plan := New(expr, &query.Options{Start: time.Unix(0, 0), End: time.Unix(0, 0)})
+			plan := NewFromAST(expr, &query.Options{Start: time.Unix(0, 0), End: time.Unix(0, 0)}, PlanOptions{})
 			optimizedPlan, _ := plan.Optimize(DefaultOptimizers)
 			expectedPlan := strings.Trim(spaces.ReplaceAllString(tcase.expected, " "), " ")
-			testutil.Equals(t, expectedPlan, renderExprTree(optimizedPlan.Expr()))
+			testutil.Equals(t, expectedPlan, renderExprTree(optimizedPlan.Root()))
 		})
 	}
 }
@@ -218,14 +220,16 @@ func TestMatcherPropagation(t *testing.T) {
 
 	optimizers := []Optimizer{PropagateMatchersOptimizer{}}
 	for _, tcase := range cases {
+		tcase := tcase
 		t.Run(tcase.name, func(t *testing.T) {
+			t.Parallel()
 			expr, err := parser.ParseExpr(tcase.expr)
 			testutil.Ok(t, err)
 
-			plan := New(expr, &query.Options{Start: time.Unix(0, 0), End: time.Unix(0, 0)})
+			plan := NewFromAST(expr, &query.Options{Start: time.Unix(0, 0), End: time.Unix(0, 0)}, PlanOptions{})
 			optimizedPlan, _ := plan.Optimize(optimizers)
 			expectedPlan := strings.Trim(spaces.ReplaceAllString(tcase.expected, " "), " ")
-			testutil.Equals(t, expectedPlan, renderExprTree(optimizedPlan.Expr()))
+			testutil.Equals(t, expectedPlan, renderExprTree(optimizedPlan.Root()))
 		})
 	}
 }
@@ -263,13 +267,72 @@ func TestTrimSorts(t *testing.T) {
 			expr:     "sort(sort(sqrt(X))/sort(sqrt(Y)))",
 			expected: "sqrt(X) / sqrt(Y)",
 		},
+		{
+			name:     "sort in argument to timestamp function",
+			expr:     "timestamp(sort(X))",
+			expected: "timestamp(sort(X))",
+		},
 	}
 	for _, tcase := range cases {
 		t.Run(tcase.name, func(t *testing.T) {
 			expr, err := parser.ParseExpr(tcase.expr)
 			testutil.Ok(t, err)
 
-			testutil.Equals(t, tcase.expected, trimSorts(expr).String())
+			exprPlan := NewFromAST(expr, &query.Options{}, PlanOptions{})
+			testutil.Equals(t, tcase.expected, exprPlan.Root().String())
+		})
+	}
+}
+
+func TestReduceConstantExpressions(t *testing.T) {
+	cases := []struct {
+		name     string
+		expr     string
+		expected string
+	}{
+		{
+			name:     "binary add",
+			expr:     "5+3",
+			expected: "8",
+		},
+		{
+			name:     "binary pow",
+			expr:     "2^8",
+			expected: "256",
+		},
+		{
+			name:     "binary mod",
+			expr:     "12%5",
+			expected: "2",
+		},
+		{
+			name:     "unary negation",
+			expr:     "2+(-5)",
+			expected: "-3",
+		},
+		{
+			name:     "function",
+			expr:     "predict_linear(X[1h], 24*60)",
+			expected: "predict_linear(X[1h], 1440)",
+		},
+		{
+			name:     "function and parens",
+			expr:     "predict_linear(X[1h], (2*12)*60)",
+			expected: "predict_linear(X[1h], 1440)",
+		},
+		{
+			name:     "aggregation",
+			expr:     "topk((3), X)",
+			expected: "topk(3, X)",
+		},
+	}
+	for _, tcase := range cases {
+		t.Run(tcase.name, func(t *testing.T) {
+			expr, err := parser.ParseExpr(tcase.expr)
+			testutil.Ok(t, err)
+
+			exprPlan := NewFromAST(expr, &query.Options{}, PlanOptions{})
+			testutil.Equals(t, tcase.expected, exprPlan.Root().String())
 		})
 	}
 }

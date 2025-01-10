@@ -92,13 +92,15 @@ func TestSetBatchSize(t *testing.T) {
 
 	optimizers := append([]Optimizer{SelectorBatchSize{Size: 10}}, DefaultOptimizers...)
 	for _, tcase := range cases {
+		tcase := tcase
 		t.Run(tcase.expr, func(t *testing.T) {
+			t.Parallel()
 			expr, err := parser.ParseExpr(tcase.expr)
 			testutil.Ok(t, err)
 
-			plan := New(expr, &query.Options{})
+			plan := NewFromAST(expr, &query.Options{}, PlanOptions{})
 			optimizedPlan, _ := plan.Optimize(optimizers)
-			testutil.Equals(t, tcase.expected, renderExprTree(optimizedPlan.Expr()))
+			testutil.Equals(t, tcase.expected, renderExprTree(optimizedPlan.Root()))
 		})
 	}
 }

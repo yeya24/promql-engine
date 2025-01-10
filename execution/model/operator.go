@@ -5,58 +5,10 @@ package model
 
 import (
 	"context"
-	"time"
+	"fmt"
 
 	"github.com/prometheus/prometheus/model/labels"
 )
-
-type NoopTelemetry struct{}
-
-type TrackedTelemetry struct {
-	name          string
-	ExecutionTime time.Duration
-}
-
-func (ti *NoopTelemetry) AddExecutionTimeTaken(t time.Duration) {}
-
-func (ti *TrackedTelemetry) AddExecutionTimeTaken(t time.Duration) {
-	ti.ExecutionTime += t
-}
-
-func (ti *TrackedTelemetry) Name() string {
-	return ti.name
-}
-
-func (ti *TrackedTelemetry) SetName(operatorName string) {
-	ti.name = operatorName
-}
-
-func (ti *NoopTelemetry) Name() string {
-	return ""
-}
-
-func (ti *NoopTelemetry) SetName(operatorName string) {}
-
-type OperatorTelemetry interface {
-	AddExecutionTimeTaken(time.Duration)
-	ExecutionTimeTaken() time.Duration
-	SetName(string)
-	Name() string
-}
-
-func (ti *NoopTelemetry) ExecutionTimeTaken() time.Duration {
-	return time.Duration(0)
-}
-
-func (ti *TrackedTelemetry) ExecutionTimeTaken() time.Duration {
-	return ti.ExecutionTime
-}
-
-type ObservableVectorOperator interface {
-	VectorOperator
-	OperatorTelemetry
-	Analyze() (OperatorTelemetry, []ObservableVectorOperator)
-}
 
 // VectorOperator performs operations on series in step by step fashion.
 type VectorOperator interface {
@@ -72,5 +24,7 @@ type VectorOperator interface {
 	GetPool() *VectorPool
 
 	// Explain returns human-readable explanation of the current operator and optional nested operators.
-	Explain() (me string, next []VectorOperator)
+	Explain() (next []VectorOperator)
+
+	fmt.Stringer
 }
