@@ -1,7 +1,7 @@
 // Copyright (c) The Thanos Community Authors.
 // Licensed under the Apache License 2.0.
 
-package storage_test
+package prometheus_test
 
 import (
 	"testing"
@@ -11,7 +11,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/require"
 
-	"github.com/thanos-io/promql-engine/execution/storage"
+	storage "github.com/thanos-io/promql-engine/storage/prometheus"
 )
 
 func TestFilter_MultipleMatcherWithSameName(t *testing.T) {
@@ -24,6 +24,7 @@ func TestFilter_MultipleMatcherWithSameName(t *testing.T) {
 }
 
 func TestFilter_Matches(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name     string
 		matchers []*labels.Matcher
@@ -72,7 +73,9 @@ func TestFilter_Matches(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			f := storage.NewFilter(tc.matchers)
 			if got := f.Matches(tc.series); got != tc.expected {
 				if tc.expected {

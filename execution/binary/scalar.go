@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 
@@ -28,6 +30,8 @@ const (
 
 // scalarOperator evaluates expressions where one operand is a scalarOperator.
 type scalarOperator struct {
+	telemetry.OperatorTelemetry
+
 	seriesOnce sync.Once
 	series     []labels.Labels
 
@@ -45,7 +49,6 @@ type scalarOperator struct {
 
 	// Keep the result if both sides are scalars.
 	bothScalars bool
-	model.OperatorTelemetry
 }
 
 func NewScalar(
@@ -70,7 +73,7 @@ func NewScalar(
 		operandValIdx = 1
 	}
 
-	o := &scalarOperator{
+	oper := &scalarOperator{
 		pool:          pool,
 		next:          next,
 		scalar:        scalar,
@@ -82,31 +85,21 @@ func NewScalar(
 		returnBool:    returnBool,
 		bothScalars:   scalarSide == ScalarSideBoth,
 	}
-	o.OperatorTelemetry = &model.NoopTelemetry{}
-	if opts.EnableAnalysis {
-		o.OperatorTelemetry = &model.TrackedTelemetry{}
-	}
-	return o, nil
+
+	oper.OperatorTelemetry = telemetry.NewTelemetry(op, opts)
+
+	return oper, nil
 
 }
 
-func (o *scalarOperator) Analyze() (model.OperatorTelemetry, []model.ObservableVectorOperator) {
-	o.SetName("[*scalarOperator]")
-	next := make([]model.ObservableVectorOperator, 0, 2)
-	if obsnext, ok := o.next.(model.ObservableVectorOperator); ok {
-		next = append(next, obsnext)
-	}
-	if obsnextScalar, ok := o.scalar.(model.ObservableVectorOperator); ok {
-		next = append(next, obsnextScalar)
-	}
-	return o, next
-}
-
-func (o *scalarOperator) Explain() (me string, next []model.VectorOperator) {
-	return fmt.Sprintf("[*scalarOperator] %s", parser.ItemTypeStr[o.opType]), []model.VectorOperator{o.next, o.scalar}
+func (o *scalarOperator) Explain() (next []model.VectorOperator) {
+	return []model.VectorOperator{o.next, o.scalar}
 }
 
 func (o *scalarOperator) Series(ctx context.Context) ([]labels.Labels, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	var err error
 	o.seriesOnce.Do(func() { err = o.loadSeries(ctx) })
 	if err != nil {
@@ -115,13 +108,19 @@ func (o *scalarOperator) Series(ctx context.Context) ([]labels.Labels, error) {
 	return o.series, nil
 }
 
+func (o *scalarOperator) String() string {
+	return fmt.Sprintf("[vectorScalarBinary] %s", parser.ItemTypeStr[o.opType])
+}
+
 func (o *scalarOperator) Next(ctx context.Context) ([]model.StepVector, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	start := time.Now()
 
 	in, err := o.next.Next(ctx)
 	if err != nil {
@@ -181,7 +180,6 @@ func (o *scalarOperator) Next(ctx context.Context) ([]model.StepVector, error) {
 
 	o.next.GetPool().PutVectors(in)
 	o.scalar.GetPool().PutVectors(scalarIn)
-	o.AddExecutionTimeTaken(time.Since(start))
 
 	return out, nil
 }

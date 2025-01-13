@@ -9,16 +9,30 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/query"
+	"github.com/thanos-io/promql-engine/storage/prometheus"
 )
 
-type operator struct{}
+type operator struct {
+	model.VectorOperator
+}
 
-func NewOperator() model.VectorOperator { return &operator{} }
+func NewOperator(opts *query.Options) model.VectorOperator {
+	scanner := prometheus.NewVectorSelector(
+		model.NewVectorPool(0),
+		noopSelector{},
+		opts,
+		0, 0, false, 0, 1,
+	)
+	return &operator{VectorOperator: scanner}
+}
 
-func (o operator) Next(ctx context.Context) ([]model.StepVector, error) { return nil, nil }
+func (o operator) String() string                         { return "[noop]" }
+func (o operator) Explain() (next []model.VectorOperator) { return nil }
 
-func (o operator) Series(ctx context.Context) ([]labels.Labels, error) { return nil, nil }
+type noopSelector struct{}
 
-func (o operator) GetPool() *model.VectorPool { return nil }
-
-func (o operator) Explain() (me string, next []model.VectorOperator) { return "noop", nil }
+func (n noopSelector) Matchers() []*labels.Matcher { return nil }
+func (n noopSelector) GetSeries(ctx context.Context, shard, numShards int) ([]prometheus.SignedSeries, error) {
+	return nil, nil
+}

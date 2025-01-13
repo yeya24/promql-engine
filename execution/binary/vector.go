@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 
-	"golang.org/x/exp/slices"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/efficientgo/core/errors"
 	"github.com/zhangyunhao116/umap"
+	"golang.org/x/exp/slices"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -55,7 +57,7 @@ type vectorOperator struct {
 	// If true then 1/0 needs to be returned instead of the value.
 	returnBool bool
 
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 }
 
 func NewVectorOperator(
@@ -67,7 +69,7 @@ func NewVectorOperator(
 	returnBool bool,
 	opts *query.Options,
 ) (model.VectorOperator, error) {
-	o := &vectorOperator{
+	oper := &vectorOperator{
 		pool:       pool,
 		lhs:        lhs,
 		rhs:        rhs,
@@ -77,33 +79,26 @@ func NewVectorOperator(
 		sigFunc:    signatureFunc(matching.On, matching.MatchingLabels...),
 	}
 
-	o.OperatorTelemetry = &model.NoopTelemetry{}
-	if opts.EnableAnalysis {
-		o.OperatorTelemetry = &model.TrackedTelemetry{}
-	}
-	return o, nil
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
+
+	return oper, nil
 }
 
-func (o *vectorOperator) Analyze() (model.OperatorTelemetry, []model.ObservableVectorOperator) {
-	o.SetName("[*vectorOperator]")
-	next := make([]model.ObservableVectorOperator, 0, 2)
-	if obsnextParamOp, ok := o.lhs.(model.ObservableVectorOperator); ok {
-		next = append(next, obsnextParamOp)
-	}
-	if obsnext, ok := o.rhs.(model.ObservableVectorOperator); ok {
-		next = append(next, obsnext)
-	}
-	return o, next
-}
-
-func (o *vectorOperator) Explain() (me string, next []model.VectorOperator) {
+func (o *vectorOperator) String() string {
 	if o.matching.On {
-		return fmt.Sprintf("[*vectorOperator] %s - %v, on: %v, group: %v", parser.ItemTypeStr[o.opType], o.matching.Card.String(), o.matching.MatchingLabels, o.matching.Include), []model.VectorOperator{o.lhs, o.rhs}
+		return fmt.Sprintf("[vectorBinary] %s - %v, on: %v, group: %v", parser.ItemTypeStr[o.opType], o.matching.Card.String(), o.matching.MatchingLabels, o.matching.Include)
 	}
-	return fmt.Sprintf("[*vectorOperator] %s - %v, ignoring: %v, group: %v", parser.ItemTypeStr[o.opType], o.matching.Card.String(), o.matching.On, o.matching.Include), []model.VectorOperator{o.lhs, o.rhs}
+	return fmt.Sprintf("[vectorBinary] %s - %v, ignoring: %v, group: %v", parser.ItemTypeStr[o.opType], o.matching.Card.String(), o.matching.On, o.matching.Include)
+}
+
+func (o *vectorOperator) Explain() (next []model.VectorOperator) {
+	return []model.VectorOperator{o.lhs, o.rhs}
 }
 
 func (o *vectorOperator) Series(ctx context.Context) ([]labels.Labels, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	if err := o.initOnce(ctx); err != nil {
 		return nil, err
 	}
@@ -111,6 +106,9 @@ func (o *vectorOperator) Series(ctx context.Context) ([]labels.Labels, error) {
 }
 
 func (o *vectorOperator) Next(ctx context.Context) ([]model.StepVector, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -272,14 +270,14 @@ func (o *vectorOperator) execBinaryUnless(lhs, rhs model.StepVector) (model.Step
 }
 
 // TODO: add support for histogram.
-func (o *vectorOperator) computeBinaryPairing(hval, lval float64) (float64, bool) {
+func (o *vectorOperator) computeBinaryPairing(hval, lval float64) (float64, bool, error) {
 	// operand is not commutative so we need to address potential swapping
 	if o.matching.Card == parser.CardOneToMany {
-		v, _, keep := vectorElemBinop(o.opType, lval, hval, nil, nil)
-		return v, keep
+		v, _, keep, err := vectorElemBinop(o.opType, lval, hval, nil, nil)
+		return v, keep, err
 	}
-	v, _, keep := vectorElemBinop(o.opType, hval, lval, nil, nil)
-	return v, keep
+	v, _, keep, err := vectorElemBinop(o.opType, hval, lval, nil, nil)
+	return v, keep, err
 }
 
 func (o *vectorOperator) execBinaryArithmetic(lhs, rhs model.StepVector) (model.StepVector, error) {
@@ -297,6 +295,11 @@ func (o *vectorOperator) execBinaryArithmetic(lhs, rhs model.StepVector) (model.
 		hcs, lcs = rhs, lhs
 	default:
 		return step, errors.Newf("Unexpected matching cardinality: %s", o.matching.Card.String())
+	}
+
+	// shortcut: if we have no samples on the high card side we cannot compute pairings
+	if len(hcs.Samples) == 0 {
+		return step, nil
 	}
 
 	for i, sampleID := range lcs.SampleIDs {
@@ -322,7 +325,10 @@ func (o *vectorOperator) execBinaryArithmetic(lhs, rhs model.StepVector) (model.
 		}
 		jp.bts = ts
 
-		val, keep := o.computeBinaryPairing(hcs.Samples[i], jp.val)
+		val, keep, err := o.computeBinaryPairing(hcs.Samples[i], jp.val)
+		if err != nil {
+			return model.StepVector{}, err
+		}
 		if o.returnBool {
 			val = 0
 			if keep {
@@ -506,59 +512,75 @@ func signatureFunc(on bool, names ...string) func(labels.Labels) uint64 {
 // Lifted from: https://github.com/prometheus/prometheus/blob/a38179c4e183d9b50b271167bf90050eda8ec3d1/promql/engine.go#L2430.
 // TODO: call with histogram values in followup PR.
 // nolint: unparam
-func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool) {
+func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool, error) {
 	switch op {
 	case parser.ADD:
 		if hlhs != nil && hrhs != nil {
 			// The histogram being added must have the larger schema
 			// code (i.e. the higher resolution).
 			if hrhs.Schema >= hlhs.Schema {
-				return 0, hlhs.Copy().Add(hrhs).Compact(0), true
+				sum, err := hlhs.Copy().Add(hrhs)
+				if err != nil {
+					return 0, nil, false, err
+				}
+				return 0, sum.Compact(0), true, nil
 			}
-			return 0, hrhs.Copy().Add(hlhs).Compact(0), true
+			sum, err := hrhs.Copy().Add(hlhs)
+			if err != nil {
+				return 0, nil, false, err
+			}
+			return 0, sum.Compact(0), true, nil
 		}
-		return lhs + rhs, nil, true
+		return lhs + rhs, nil, true, nil
 	case parser.SUB:
 		if hlhs != nil && hrhs != nil {
 			// The histogram being subtracted must have the larger schema
 			// code (i.e. the higher resolution).
 			if hrhs.Schema >= hlhs.Schema {
-				return 0, hlhs.Copy().Sub(hrhs).Compact(0), true
+				diff, err := hlhs.Copy().Sub(hrhs)
+				if err != nil {
+					return 0, nil, false, err
+				}
+				return 0, diff.Compact(0), true, nil
 			}
-			return 0, hrhs.Copy().Mul(-1).Add(hlhs).Compact(0), true
+			diff, err := hrhs.Copy().Mul(-1).Add(hlhs)
+			if err != nil {
+				return 0, nil, false, err
+			}
+			return 0, diff.Compact(0), true, nil
 		}
-		return lhs - rhs, nil, true
+		return lhs - rhs, nil, true, nil
 	case parser.MUL:
 		if hlhs != nil && hrhs == nil {
-			return 0, hlhs.Copy().Mul(rhs), true
+			return 0, hlhs.Copy().Mul(rhs), true, nil
 		}
 		if hlhs == nil && hrhs != nil {
-			return 0, hrhs.Copy().Mul(lhs), true
+			return 0, hrhs.Copy().Mul(lhs), true, nil
 		}
-		return lhs * rhs, nil, true
+		return lhs * rhs, nil, true, nil
 	case parser.DIV:
 		if hlhs != nil && hrhs == nil {
-			return 0, hlhs.Copy().Div(rhs), true
+			return 0, hlhs.Copy().Div(rhs), true, nil
 		}
-		return lhs / rhs, nil, true
+		return lhs / rhs, nil, true, nil
 	case parser.POW:
-		return math.Pow(lhs, rhs), nil, true
+		return math.Pow(lhs, rhs), nil, true, nil
 	case parser.MOD:
-		return math.Mod(lhs, rhs), nil, true
+		return math.Mod(lhs, rhs), nil, true, nil
 	case parser.EQLC:
-		return lhs, nil, lhs == rhs
+		return lhs, nil, lhs == rhs, nil
 	case parser.NEQ:
-		return lhs, nil, lhs != rhs
+		return lhs, nil, lhs != rhs, nil
 	case parser.GTR:
-		return lhs, nil, lhs > rhs
+		return lhs, nil, lhs > rhs, nil
 	case parser.LSS:
-		return lhs, nil, lhs < rhs
+		return lhs, nil, lhs < rhs, nil
 	case parser.GTE:
-		return lhs, nil, lhs >= rhs
+		return lhs, nil, lhs >= rhs, nil
 	case parser.LTE:
-		return lhs, nil, lhs <= rhs
+		return lhs, nil, lhs <= rhs, nil
 	case parser.ATAN2:
-		return math.Atan2(lhs, rhs), nil, true
+		return math.Atan2(lhs, rhs), nil, true, nil
 	}
 	panic(errors.Newf("operator %q not allowed for operations between Vectors", op))
 }

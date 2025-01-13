@@ -8,10 +8,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+
 	"github.com/prometheus/prometheus/model/labels"
 	"gonum.org/v1/gonum/floats"
 
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/query"
 )
 
 type unaryNegation struct {
@@ -19,34 +22,30 @@ type unaryNegation struct {
 	once sync.Once
 
 	series []labels.Labels
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 }
 
-func (u *unaryNegation) Explain() (me string, next []model.VectorOperator) {
-	return "[*unaryNegation]", []model.VectorOperator{u.next}
-}
-
-func NewUnaryNegation(
-	next model.VectorOperator,
-	stepsBatch int,
-) (model.VectorOperator, error) {
+func NewUnaryNegation(next model.VectorOperator, opts *query.Options) (model.VectorOperator, error) {
 	u := &unaryNegation{
-		next:              next,
-		OperatorTelemetry: &model.TrackedTelemetry{},
+		next: next,
 	}
+	u.OperatorTelemetry = telemetry.NewTelemetry(u, opts)
 
 	return u, nil
 }
-func (u *unaryNegation) Analyze() (model.OperatorTelemetry, []model.ObservableVectorOperator) {
-	u.SetName("[*unaryNegation]")
-	next := make([]model.ObservableVectorOperator, 0, 1)
-	if obsnext, ok := u.next.(model.ObservableVectorOperator); ok {
-		next = append(next, obsnext)
-	}
-	return u, next
+
+func (u *unaryNegation) Explain() (next []model.VectorOperator) {
+	return []model.VectorOperator{u.next}
+}
+
+func (u *unaryNegation) String() string {
+	return "[unaryNegation]"
 }
 
 func (u *unaryNegation) Series(ctx context.Context) ([]labels.Labels, error) {
+	start := time.Now()
+	defer func() { u.AddExecutionTimeTaken(time.Since(start)) }()
+
 	if err := u.loadSeries(ctx); err != nil {
 		return nil, err
 	}
@@ -75,12 +74,15 @@ func (u *unaryNegation) GetPool() *model.VectorPool {
 }
 
 func (u *unaryNegation) Next(ctx context.Context) ([]model.StepVector, error) {
+	start := time.Now()
+	defer func() { u.AddExecutionTimeTaken(time.Since(start)) }()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	start := time.Now()
+
 	in, err := u.next.Next(ctx)
 	if err != nil {
 		return nil, err
@@ -91,6 +93,5 @@ func (u *unaryNegation) Next(ctx context.Context) ([]model.StepVector, error) {
 	for i := range in {
 		floats.Scale(-1, in[i].Samples)
 	}
-	u.AddExecutionTimeTaken(time.Since(start))
 	return in, nil
 }

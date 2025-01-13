@@ -1,7 +1,7 @@
 // Copyright (c) The Thanos Community Authors.
 // Licensed under the Apache License 2.0.
 
-package scan
+package ringbuffer
 
 import (
 	"math"
@@ -12,33 +12,32 @@ import (
 	"github.com/thanos-io/promql-engine/execution/parse"
 )
 
-type Sample struct {
-	T int64
-	F float64
-	H *histogram.FloatHistogram
-}
+type SamplesBuffer GenericRingBuffer
 
 type FunctionArgs struct {
 	Samples          []Sample
 	StepTime         int64
 	SelectRange      int64
-	ScalarPoints     []float64
 	Offset           int64
 	MetricAppearedTs *int64
+
+	// Only holt-winters uses two arguments, we fall back for that.
+	// quantile_over_time and predict_linear use one, so we only use one here.
+	ScalarPoint float64
 }
 
-type FunctionCall func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool)
+type FunctionCall func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error)
 
 func instantValue(samples []Sample, isRate bool) (float64, bool) {
 	lastSample := samples[len(samples)-1]
 	previousSample := samples[len(samples)-2]
 
 	var resultValue float64
-	if isRate && lastSample.F < previousSample.F {
+	if isRate && lastSample.V.F < previousSample.V.F {
 		// Counter reset.
-		resultValue = lastSample.F
+		resultValue = lastSample.V.F
 	} else {
-		resultValue = lastSample.F - previousSample.F
+		resultValue = lastSample.V.F - previousSample.V.F
 	}
 
 	sampledInterval := lastSample.T - previousSample.T
@@ -56,160 +55,188 @@ func instantValue(samples []Sample, isRate bool) (float64, bool) {
 }
 
 var rangeVectorFuncs = map[string]FunctionCall{
-	"sum_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"sum_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return sumOverTime(f.Samples), nil, true
+		return sumOverTime(f.Samples), nil, true, nil
 	},
-	"max_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"max_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return maxOverTime(f.Samples), nil, true
+		return maxOverTime(f.Samples), nil, true, nil
 	},
-	"min_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"min_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return minOverTime(f.Samples), nil, true
+		return minOverTime(f.Samples), nil, true, nil
 	},
-	"avg_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"avg_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return avgOverTime(f.Samples), nil, true
+		return avgOverTime(f.Samples), nil, true, nil
 	},
-	"stddev_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"stddev_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return stddevOverTime(f.Samples), nil, true
+		return stddevOverTime(f.Samples), nil, true, nil
 	},
-	"stdvar_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"stdvar_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return stdvarOverTime(f.Samples), nil, true
+		return stdvarOverTime(f.Samples), nil, true, nil
 	},
-	"count_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"count_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return countOverTime(f.Samples), nil, true
+		return countOverTime(f.Samples), nil, true, nil
 	},
-	"last_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"last_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return f.Samples[len(f.Samples)-1].F, nil, true
-	},
-	"present_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
-		if len(f.Samples) == 0 {
-			return 0., nil, false
+		if f.Samples[0].V.H != nil {
+			return 0, f.Samples[len(f.Samples)-1].V.H.Copy(), true, nil
 		}
-		return 1., nil, true
+		return f.Samples[len(f.Samples)-1].V.F, nil, true, nil
 	},
-	"quantile_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"present_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
+		}
+		return 1., nil, true, nil
+	},
+	"quantile_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
+		if len(f.Samples) == 0 {
+			return 0., nil, false, nil
 		}
 		floats := make([]float64, len(f.Samples))
-		for i, v := range f.Samples {
-			floats[i] = v.F
+		for i, sample := range f.Samples {
+			floats[i] = sample.V.F
 		}
-		return aggregate.Quantile(f.ScalarPoints[0], floats), nil, true
+		return aggregate.Quantile(f.ScalarPoint, floats), nil, true, nil
 	},
-	"changes": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"changes": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return changes(f.Samples), nil, true
+		return changes(f.Samples), nil, true, nil
 	},
-	"resets": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"resets": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return resets(f.Samples), nil, true
+		return resets(f.Samples), nil, true, nil
 	},
-	"deriv": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"deriv": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) < 2 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return deriv(f.Samples), nil, true
+		return deriv(f.Samples), nil, true, nil
 	},
-	"irate": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"irate": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		f.Samples = filterFloatOnlySamples(f.Samples)
 		if len(f.Samples) < 2 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
 		val, ok := instantValue(f.Samples, true)
 		if !ok {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return val, nil, true
+		return val, nil, true, nil
 	},
-	"idelta": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"idelta": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		f.Samples = filterFloatOnlySamples(f.Samples)
 		if len(f.Samples) < 2 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
 		val, ok := instantValue(f.Samples, false)
 		if !ok {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		return val, nil, true
+		return val, nil, true, nil
 	},
-	"rate": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"rate": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) < 2 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		v, h := extrapolatedRate(f.Samples, true, true, f.StepTime, f.SelectRange, f.Offset)
-		return v, h, true
+		v, h, err := extrapolatedRate(f.Samples, len(f.Samples), true, true, f.StepTime, f.SelectRange, f.Offset)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		return v, h, true, nil
 	},
-	"delta": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"delta": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) < 2 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		v, h := extrapolatedRate(f.Samples, false, false, f.StepTime, f.SelectRange, f.Offset)
-		return v, h, true
+		v, h, err := extrapolatedRate(f.Samples, len(f.Samples), false, false, f.StepTime, f.SelectRange, f.Offset)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		return v, h, true, nil
 	},
-	"increase": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"increase": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) < 2 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
-		v, h := extrapolatedRate(f.Samples, true, false, f.StepTime, f.SelectRange, f.Offset)
-		return v, h, true
+		v, h, err := extrapolatedRate(f.Samples, len(f.Samples), true, false, f.StepTime, f.SelectRange, f.Offset)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		return v, h, true, nil
 	},
-	"xrate": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"xrate": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
 		if f.MetricAppearedTs == nil {
 			panic("BUG: we got some Samples but metric still hasn't appeared")
 		}
-		v, h := extendedRate(f.Samples, true, true, f.StepTime, f.SelectRange, f.Offset, *f.MetricAppearedTs)
-		return v, h, true
+		v, h, err := extendedRate(f.Samples, true, true, f.StepTime, f.SelectRange, f.Offset, *f.MetricAppearedTs)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		return v, h, true, nil
 	},
-	"xdelta": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"xdelta": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
 		if f.MetricAppearedTs == nil {
 			panic("BUG: we got some Samples but metric still hasn't appeared")
 		}
-		v, h := extendedRate(f.Samples, false, false, f.StepTime, f.SelectRange, f.Offset, *f.MetricAppearedTs)
-		return v, h, true
+		v, h, err := extendedRate(f.Samples, false, false, f.StepTime, f.SelectRange, f.Offset, *f.MetricAppearedTs)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		return v, h, true, nil
 	},
-	"xincrease": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+	"xincrease": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
 		if len(f.Samples) == 0 {
-			return 0., nil, false
+			return 0., nil, false, nil
 		}
 		if f.MetricAppearedTs == nil {
 			panic("BUG: we got some Samples but metric still hasn't appeared")
 		}
-		v, h := extendedRate(f.Samples, true, false, f.StepTime, f.SelectRange, f.Offset, *f.MetricAppearedTs)
-		return v, h, true
+		v, h, err := extendedRate(f.Samples, true, false, f.StepTime, f.SelectRange, f.Offset, *f.MetricAppearedTs)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		return v, h, true, nil
+	},
+	"predict_linear": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool, error) {
+		if len(f.Samples) < 2 {
+			return 0., nil, false, nil
+		}
+		v := predictLinear(f.Samples, f.ScalarPoint, f.StepTime)
+		return v, nil, true, nil
 	},
 }
 
@@ -225,7 +252,7 @@ func NewRangeVectorFunc(name string) (FunctionCall, error) {
 // It calculates the rate (allowing for counter resets if isCounter is true),
 // extrapolates if the first/last sample is close to the boundary, and returns
 // the result as either per-second (if isRate is true) or overall.
-func extrapolatedRate(samples []Sample, isCounter, isRate bool, stepTime int64, selectRange int64, offset int64) (float64, *histogram.FloatHistogram) {
+func extrapolatedRate(samples []Sample, numSamples int, isCounter, isRate bool, stepTime int64, selectRange int64, offset int64) (float64, *histogram.FloatHistogram, error) {
 	var (
 		rangeStart      = stepTime - (selectRange + offset)
 		rangeEnd        = stepTime - offset
@@ -233,17 +260,21 @@ func extrapolatedRate(samples []Sample, isCounter, isRate bool, stepTime int64, 
 		resultHistogram *histogram.FloatHistogram
 	)
 
-	if samples[0].H != nil {
-		resultHistogram = histogramRate(samples, isCounter)
+	var err error
+	if samples[0].V.H != nil {
+		resultHistogram, err = histogramRate(samples, isCounter)
+		if err != nil {
+			return 0, nil, err
+		}
 	} else {
-		resultValue = samples[len(samples)-1].F - samples[0].F
+		resultValue = samples[len(samples)-1].V.F - samples[0].V.F
 		if isCounter {
 			var lastValue float64
 			for _, sample := range samples {
-				if sample.F < lastValue {
+				if sample.V.F < lastValue {
 					resultValue += lastValue
 				}
-				lastValue = sample.F
+				lastValue = sample.V.F
 			}
 		}
 	}
@@ -253,9 +284,19 @@ func extrapolatedRate(samples []Sample, isCounter, isRate bool, stepTime int64, 
 	durationToEnd := float64(rangeEnd-samples[len(samples)-1].T) / 1000
 
 	sampledInterval := float64(samples[len(samples)-1].T-samples[0].T) / 1000
-	averageDurationBetweenSamples := sampledInterval / float64(len(samples)-1)
+	averageDurationBetweenSamples := sampledInterval / float64(numSamples-1)
 
-	if isCounter && resultValue > 0 && samples[0].F >= 0 {
+	// If the first/last samples are close to the boundaries of the range,
+	// extrapolate the result. This is as we expect that another sample
+	// will exist given the spacing between samples we've seen thus far,
+	// with an allowance for noise.
+	extrapolationThreshold := averageDurationBetweenSamples * 1.1
+	extrapolateToInterval := sampledInterval
+
+	if durationToStart >= extrapolationThreshold {
+		durationToStart = averageDurationBetweenSamples / 2
+	}
+	if isCounter && resultValue > 0 && samples[0].V.F >= 0 {
 		// Counters cannot be negative. If we have any slope at
 		// all (i.e. resultValue went up), we can extrapolate
 		// the zero point of the counter. If the duration to the
@@ -263,29 +304,19 @@ func extrapolatedRate(samples []Sample, isCounter, isRate bool, stepTime int64, 
 		// take the zero point as the start of the series,
 		// thereby avoiding extrapolation to negative counter
 		// values.
-		durationToZero := sampledInterval * (samples[0].F / resultValue)
+		// TODO(beorn7): Do this for histograms, too.
+		durationToZero := sampledInterval * (samples[0].V.F / resultValue)
 		if durationToZero < durationToStart {
 			durationToStart = durationToZero
 		}
 	}
+	extrapolateToInterval += durationToStart
 
-	// If the first/last Samples are close to the boundaries of the range,
-	// extrapolate the result. This is as we expect that another sample
-	// will exist given the spacing between Samples we've seen thus far,
-	// with an allowance for noise.
-	extrapolationThreshold := averageDurationBetweenSamples * 1.1
-	extrapolateToInterval := sampledInterval
+	if durationToEnd >= extrapolationThreshold {
+		durationToEnd = averageDurationBetweenSamples / 2
+	}
+	extrapolateToInterval += durationToEnd
 
-	if durationToStart < extrapolationThreshold {
-		extrapolateToInterval += durationToStart
-	} else {
-		extrapolateToInterval += averageDurationBetweenSamples / 2
-	}
-	if durationToEnd < extrapolationThreshold {
-		extrapolateToInterval += durationToEnd
-	} else {
-		extrapolateToInterval += averageDurationBetweenSamples / 2
-	}
 	factor := extrapolateToInterval / sampledInterval
 	if isRate {
 		factor /= float64(selectRange / 1000)
@@ -294,16 +325,17 @@ func extrapolatedRate(samples []Sample, isCounter, isRate bool, stepTime int64, 
 		resultValue *= factor
 	} else {
 		resultHistogram.Mul(factor)
+
 	}
 
-	return resultValue, resultHistogram
+	return resultValue, resultHistogram, nil
 }
 
 // extendedRate is a utility function for xrate/xincrease/xdelta.
 // It calculates the rate (allowing for counter resets if isCounter is true),
 // taking into account the last sample before the range start, and returns
 // the result as either per-second (if isRate is true) or overall.
-func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, selectRange int64, offset int64, metricAppearedTs int64) (float64, *histogram.FloatHistogram) {
+func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, selectRange int64, offset int64, metricAppearedTs int64) (float64, *histogram.FloatHistogram, error) {
 	var (
 		rangeStart      = stepTime - (selectRange + offset)
 		rangeEnd        = stepTime - offset
@@ -311,15 +343,20 @@ func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, sele
 		resultHistogram *histogram.FloatHistogram
 	)
 
-	if samples[0].H != nil {
+	if samples[0].V.H != nil {
+		var err error
 		// TODO - support extended rate for histograms
-		resultHistogram = histogramRate(samples, isCounter)
-		return resultValue, resultHistogram
+		resultHistogram, err = histogramRate(samples, isCounter)
+		if err != nil {
+			return 0, nil, err
+		}
+
+		return resultValue, resultHistogram, nil
 	}
 
 	sameVals := true
 	for i := range samples {
-		if i > 0 && samples[i-1].F != samples[i].F {
+		if i > 0 && samples[i-1].V.F != samples[i].V.F {
 			sameVals = false
 			break
 		}
@@ -331,7 +368,7 @@ func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, sele
 	if isCounter && !isRate && sameVals {
 		// Make sure we are not at the end of the range.
 		if stepTime-offset <= until {
-			return samples[0].F, nil
+			return samples[0].V.F, nil, nil
 		}
 	}
 
@@ -344,7 +381,7 @@ func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, sele
 		// If the point before the range is too far from rangeStart, drop it.
 		if float64(rangeStart-samples[0].T) > averageDurationBetweenSamples {
 			if len(samples) < 3 {
-				return resultValue, nil
+				return resultValue, nil, nil
 			}
 			firstPoint = 1
 			sampledInterval = float64(samples[len(samples)-1].T - samples[1].T)
@@ -359,13 +396,13 @@ func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, sele
 	if isCounter {
 		for i := firstPoint; i < len(samples); i++ {
 			sample := samples[i]
-			if sample.F < lastValue {
+			if sample.V.F < lastValue {
 				counterCorrection += lastValue
 			}
-			lastValue = sample.F
+			lastValue = sample.V.F
 		}
 	}
-	resultValue = samples[len(samples)-1].F - samples[firstPoint].F + counterCorrection
+	resultValue = samples[len(samples)-1].V.F - samples[firstPoint].V.F + counterCorrection
 
 	// Duration between last sample and boundary of range.
 	durationToEnd := float64(rangeEnd - samples[len(samples)-1].T)
@@ -384,22 +421,22 @@ func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, sele
 		resultValue = resultValue / float64(selectRange/1000)
 	}
 
-	return resultValue, nil
+	return resultValue, nil, nil
 }
 
 // histogramRate is a helper function for extrapolatedRate. It requires
 // points[0] to be a histogram. It returns nil if any other Point in points is
 // not a histogram.
-func histogramRate(points []Sample, isCounter bool) *histogram.FloatHistogram {
+func histogramRate(points []Sample, isCounter bool) (*histogram.FloatHistogram, error) {
 	// Calculating a rate on a single sample is not defined.
 	if len(points) < 2 {
-		return nil
+		return nil, nil
 	}
 
-	prev := points[0].H // We already know that this is a histogram.
-	last := points[len(points)-1].H
+	prev := points[0].V.H // We already know that this is a histogram.
+	last := points[len(points)-1].V.H
 	if last == nil {
-		return nil // Range contains a mix of histograms and floats.
+		return nil, nil // Range contains a mix of histograms and floats.
 	}
 	minSchema := prev.Schema
 	if last.Schema < minSchema {
@@ -412,9 +449,9 @@ func histogramRate(points []Sample, isCounter bool) *histogram.FloatHistogram {
 	// - Are all data points histograms?
 	//   []FloatPoint and a []HistogramPoint separately.
 	for _, currPoint := range points[1 : len(points)-1] {
-		curr := currPoint.H
+		curr := currPoint.V.H
 		if curr == nil {
-			return nil // Range contains a mix of histograms and floats.
+			return nil, nil // Range contains a mix of histograms and floats.
 		}
 		if !isCounter {
 			continue
@@ -425,37 +462,41 @@ func histogramRate(points []Sample, isCounter bool) *histogram.FloatHistogram {
 	}
 
 	h := last.CopyToSchema(minSchema)
-	h.Sub(prev)
+	if _, err := h.Sub(prev); err != nil {
+		return nil, err
+	}
 
 	if isCounter {
 		// Second iteration to deal with counter resets.
 		for _, currPoint := range points[1:] {
-			curr := currPoint.H
+			curr := currPoint.V.H
 			if curr.DetectReset(prev) {
-				h.Add(prev)
+				if _, err := h.Add(prev); err != nil {
+					return nil, err
+				}
 			}
 			prev = curr
 		}
 	}
 	h.CounterResetHint = histogram.GaugeType
-	return h.Compact(0)
+	return h.Compact(0), nil
 }
 
 func maxOverTime(points []Sample) float64 {
-	max := points[0].F
+	max := points[0].V.F
 	for _, v := range points {
-		if v.F > max || math.IsNaN(max) {
-			max = v.F
+		if v.V.F > max || math.IsNaN(max) {
+			max = v.V.F
 		}
 	}
 	return max
 }
 
 func minOverTime(points []Sample) float64 {
-	min := points[0].F
+	min := points[0].V.F
 	for _, v := range points {
-		if v.F < min || math.IsNaN(min) {
-			min = v.F
+		if v.V.F < min || math.IsNaN(min) {
+			min = v.V.F
 		}
 	}
 	return min
@@ -470,13 +511,13 @@ func avgOverTime(points []Sample) float64 {
 	for _, v := range points {
 		count++
 		if math.IsInf(mean, 0) {
-			if math.IsInf(v.F, 0) && (mean > 0) == (v.F > 0) {
-				// The `mean` and `v.F` values are `Inf` of the same sign.  They
+			if math.IsInf(v.V.F, 0) && (mean > 0) == (v.V.F > 0) {
+				// The `mean` and `v.V.F` values are `Inf` of the same sign.  They
 				// can't be subtracted, but the value of `mean` is correct
 				// already.
 				continue
 			}
-			if !math.IsInf(v.F, 0) && !math.IsNaN(v.F) {
+			if !math.IsInf(v.V.F, 0) && !math.IsNaN(v.V.F) {
 				// At this stage, the mean is an infinite. If the added
 				// value is neither an Inf or a Nan, we can keep that mean
 				// value.
@@ -486,7 +527,7 @@ func avgOverTime(points []Sample) float64 {
 				continue
 			}
 		}
-		mean, c = kahanSumInc(v.F/count-mean/count, mean, c)
+		mean, c = kahanSumInc(v.V.F/count-mean/count, mean, c)
 	}
 
 	if math.IsInf(mean, 0) {
@@ -498,7 +539,7 @@ func avgOverTime(points []Sample) float64 {
 func sumOverTime(points []Sample) float64 {
 	var sum, c float64
 	for _, v := range points {
-		sum, c = kahanSumInc(v.F, sum, c)
+		sum, c = kahanSumInc(v.V.F, sum, c)
 	}
 	if math.IsInf(sum, 0) {
 		return sum
@@ -512,9 +553,9 @@ func stddevOverTime(points []Sample) float64 {
 	var aux, cAux float64
 	for _, v := range points {
 		count++
-		delta := v.F - (mean + cMean)
+		delta := v.V.F - (mean + cMean)
 		mean, cMean = kahanSumInc(delta/count, mean, cMean)
-		aux, cAux = kahanSumInc(delta*(v.F-(mean+cMean)), aux, cAux)
+		aux, cAux = kahanSumInc(delta*(v.V.F-(mean+cMean)), aux, cAux)
 	}
 	return math.Sqrt((aux + cAux) / count)
 }
@@ -525,19 +566,19 @@ func stdvarOverTime(points []Sample) float64 {
 	var aux, cAux float64
 	for _, v := range points {
 		count++
-		delta := v.F - (mean + cMean)
+		delta := v.V.F - (mean + cMean)
 		mean, cMean = kahanSumInc(delta/count, mean, cMean)
-		aux, cAux = kahanSumInc(delta*(v.F-(mean+cMean)), aux, cAux)
+		aux, cAux = kahanSumInc(delta*(v.V.F-(mean+cMean)), aux, cAux)
 	}
 	return (aux + cAux) / count
 }
 
 func changes(points []Sample) float64 {
 	var count float64
-	prev := points[0].F
+	prev := points[0].V.F
 	count = 0
 	for _, sample := range points[1:] {
-		current := sample.F
+		current := sample.V.F
 		if current != prev && !(math.IsNaN(current) && math.IsNaN(prev)) {
 			count++
 		}
@@ -554,11 +595,16 @@ func deriv(points []Sample) float64 {
 	return slope
 }
 
+func predictLinear(points []Sample, duration float64, stepTime int64) float64 {
+	slope, intercept := linearRegression(points, stepTime)
+	return slope*duration + intercept
+}
+
 func resets(points []Sample) float64 {
 	count := 0
-	prev := points[0].F
+	prev := points[0].V.F
 	for _, sample := range points[1:] {
-		current := sample.F
+		current := sample.V.F
 		if current < prev {
 			count++
 		}
@@ -578,18 +624,18 @@ func linearRegression(Samples []Sample, interceptTime int64) (slope, intercept f
 		initY      float64
 		constY     bool
 	)
-	initY = Samples[0].F
+	initY = Samples[0].V.F
 	constY = true
 	for i, sample := range Samples {
 		// Set constY to false if any new y values are encountered.
-		if constY && i > 0 && sample.F != initY {
+		if constY && i > 0 && sample.V.F != initY {
 			constY = false
 		}
 		n += 1.0
 		x := float64(sample.T-interceptTime) / 1e3
 		sumX, cX = kahanSumInc(x, sumX, cX)
-		sumY, cY = kahanSumInc(sample.F, sumY, cY)
-		sumXY, cXY = kahanSumInc(x*sample.F, sumXY, cXY)
+		sumY, cY = kahanSumInc(sample.V.F, sumY, cY)
+		sumXY, cXY = kahanSumInc(x*sample.V.F, sumXY, cXY)
 		sumX2, cX2 = kahanSumInc(x*x, sumX2, cX2)
 	}
 	if constY {
@@ -614,7 +660,7 @@ func linearRegression(Samples []Sample, interceptTime int64) (slope, intercept f
 func filterFloatOnlySamples(samples []Sample) []Sample {
 	i := 0
 	for _, sample := range samples {
-		if sample.H == nil {
+		if sample.V.H == nil {
 			samples[i] = sample
 			i++
 		}

@@ -10,79 +10,32 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+
 	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/prometheus/prometheus/promql/parser"
 
 	"github.com/thanos-io/promql-engine/execution/model"
 	"github.com/thanos-io/promql-engine/execution/parse"
 	"github.com/thanos-io/promql-engine/extlabels"
+	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
 )
 
-// functionOperator returns []model.StepVector after processing input with desired function.
-type functionOperator struct {
-	funcExpr *parser.Call
-	series   []labels.Labels
-	once     sync.Once
-
-	vectorIndex int
-	nextOps     []model.VectorOperator
-
-	call         functionCall
-	scalarPoints [][]float64
-	model.OperatorTelemetry
-}
-
-func SetTelemetry(opts *query.Options) model.OperatorTelemetry {
-	if opts.EnableAnalysis {
-		return &model.TrackedTelemetry{}
-	}
-	return &model.NoopTelemetry{}
-}
-
-func NewFunctionOperator(funcExpr *parser.Call, nextOps []model.VectorOperator, stepsBatch int, opts *query.Options) (model.VectorOperator, error) {
+func NewFunctionOperator(funcExpr *logicalplan.FunctionCall, nextOps []model.VectorOperator, stepsBatch int, opts *query.Options) (model.VectorOperator, error) {
 	// Some functions need to be handled in special operators
-
 	switch funcExpr.Func.Name {
 	case "scalar":
-		return &scalarFunctionOperator{
-			next:              nextOps[0],
-			pool:              model.NewVectorPoolWithSize(stepsBatch, 1),
-			OperatorTelemetry: SetTelemetry(opts),
-		}, nil
+		return newScalarOperator(model.NewVectorPoolWithSize(stepsBatch, 1), nextOps[0], opts), nil
 	case "timestamp":
-		return &timestampFunctionOperator{
-			next:              nextOps[0],
-			OperatorTelemetry: SetTelemetry(opts),
-		}, nil
-
+		return newTimestampOperator(nextOps[0], opts), nil
 	case "label_join", "label_replace":
-		return &relabelFunctionOperator{
-			next:              nextOps[0],
-			funcExpr:          funcExpr,
-			OperatorTelemetry: SetTelemetry(opts),
-		}, nil
-
+		return newRelabelOperator(nextOps[0], funcExpr, opts), nil
 	case "absent":
-		return &absentOperator{
-			next:              nextOps[0],
-			pool:              model.NewVectorPool(stepsBatch),
-			funcExpr:          funcExpr,
-			OperatorTelemetry: SetTelemetry(opts),
-		}, nil
-
+		return newAbsentOperator(funcExpr, model.NewVectorPool(stepsBatch), nextOps[0], opts), nil
 	case "histogram_quantile":
-		return &histogramOperator{
-			pool:              model.NewVectorPool(stepsBatch),
-			funcArgs:          funcExpr.Args,
-			once:              sync.Once{},
-			scalarOp:          nextOps[0],
-			vectorOp:          nextOps[1],
-			scalarPoints:      make([]float64, stepsBatch),
-			OperatorTelemetry: SetTelemetry(opts),
-		}, nil
+		return newHistogramOperator(model.NewVectorPool(stepsBatch), funcExpr.Args, nextOps[0], nextOps[1], opts), nil
 	}
 
 	// Short-circuit functions that take no args. Their only input is the step's timestamp.
@@ -93,10 +46,10 @@ func NewFunctionOperator(funcExpr *parser.Call, nextOps []model.VectorOperator, 
 	return newInstantVectorFunctionOperator(funcExpr, nextOps, stepsBatch, opts)
 }
 
-func newNoArgsFunctionOperator(funcExpr *parser.Call, stepsBatch int, opts *query.Options) (model.VectorOperator, error) {
+func newNoArgsFunctionOperator(funcExpr *logicalplan.FunctionCall, stepsBatch int, opts *query.Options) (model.VectorOperator, error) {
 	call, ok := noArgFuncs[funcExpr.Func.Name]
 	if !ok {
-		return nil, UnknownFunctionError(funcExpr.Func.Name)
+		return nil, parse.UnknownFunctionError(funcExpr.Func.Name)
 	}
 
 	interval := opts.Step.Milliseconds()
@@ -115,6 +68,8 @@ func newNoArgsFunctionOperator(funcExpr *parser.Call, stepsBatch int, opts *quer
 		call:        call,
 		vectorPool:  model.NewVectorPool(stepsBatch),
 	}
+	op.OperatorTelemetry = telemetry.NewTelemetry(op, opts)
+
 	switch funcExpr.Func.Name {
 	case "pi", "time":
 		op.sampleIDs = []uint64{0}
@@ -123,18 +78,29 @@ func newNoArgsFunctionOperator(funcExpr *parser.Call, stepsBatch int, opts *quer
 		op.series = []labels.Labels{{}}
 		op.sampleIDs = []uint64{0}
 	}
-	op.OperatorTelemetry = &model.NoopTelemetry{}
-	if opts.EnableAnalysis {
-		op.OperatorTelemetry = &model.TrackedTelemetry{}
-	}
 
 	return op, nil
 }
 
-func newInstantVectorFunctionOperator(funcExpr *parser.Call, nextOps []model.VectorOperator, stepsBatch int, opts *query.Options) (model.VectorOperator, error) {
+// functionOperator returns []model.StepVector after processing input with desired function.
+type functionOperator struct {
+	telemetry.OperatorTelemetry
+
+	funcExpr *logicalplan.FunctionCall
+	series   []labels.Labels
+	once     sync.Once
+
+	vectorIndex int
+	nextOps     []model.VectorOperator
+
+	call         functionCall
+	scalarPoints [][]float64
+}
+
+func newInstantVectorFunctionOperator(funcExpr *logicalplan.FunctionCall, nextOps []model.VectorOperator, stepsBatch int, opts *query.Options) (model.VectorOperator, error) {
 	call, ok := instantVectorFuncs[funcExpr.Func.Name]
 	if !ok {
-		return nil, UnknownFunctionError(funcExpr.Func.Name)
+		return nil, parse.UnknownFunctionError(funcExpr.Func.Name)
 	}
 
 	scalarPoints := make([][]float64, stepsBatch)
@@ -148,20 +114,17 @@ func newInstantVectorFunctionOperator(funcExpr *parser.Call, nextOps []model.Vec
 		vectorIndex:  0,
 		scalarPoints: scalarPoints,
 	}
+	f.OperatorTelemetry = telemetry.NewTelemetry(f, opts)
 
 	for i := range funcExpr.Args {
-		if funcExpr.Args[i].Type() == parser.ValueTypeVector {
+		if funcExpr.Args[i].ReturnType() == parser.ValueTypeVector {
 			f.vectorIndex = i
 			break
 		}
 	}
-	f.OperatorTelemetry = &model.NoopTelemetry{}
-	if opts.EnableAnalysis {
-		f.OperatorTelemetry = &model.TrackedTelemetry{}
-	}
 
 	// Check selector type.
-	switch funcExpr.Args[f.vectorIndex].Type() {
+	switch funcExpr.Args[f.vectorIndex].ReturnType() {
 	case parser.ValueTypeVector, parser.ValueTypeScalar:
 		return f, nil
 	default:
@@ -169,22 +132,18 @@ func newInstantVectorFunctionOperator(funcExpr *parser.Call, nextOps []model.Vec
 	}
 }
 
-func (o *functionOperator) Analyze() (model.OperatorTelemetry, []model.ObservableVectorOperator) {
-	o.SetName("[*functionOperator]")
-	obsOperators := make([]model.ObservableVectorOperator, 0, len(o.nextOps))
-	for _, operator := range o.nextOps {
-		if obsOperator, ok := operator.(model.ObservableVectorOperator); ok {
-			obsOperators = append(obsOperators, obsOperator)
-		}
-	}
-	return o, obsOperators
+func (o *functionOperator) Explain() (next []model.VectorOperator) {
+	return o.nextOps
 }
 
-func (o *functionOperator) Explain() (me string, next []model.VectorOperator) {
-	return fmt.Sprintf("[*functionOperator] %v(%v)", o.funcExpr.Func.Name, o.funcExpr.Args), o.nextOps
+func (o *functionOperator) String() string {
+	return fmt.Sprintf("[function] %v(%v)", o.funcExpr.Func.Name, o.funcExpr.Args)
 }
 
 func (o *functionOperator) Series(ctx context.Context) ([]labels.Labels, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	if err := o.loadSeries(ctx); err != nil {
 		return nil, err
 	}
@@ -197,16 +156,18 @@ func (o *functionOperator) GetPool() *model.VectorPool {
 }
 
 func (o *functionOperator) Next(ctx context.Context) ([]model.StepVector, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-
 	if err := o.loadSeries(ctx); err != nil {
 		return nil, err
 	}
-	start := time.Now()
+
 	// Process non-variadic single/multi-arg instant vector and scalar input functions.
 	// Call next on vector input.
 	vectors, err := o.nextOps[o.vectorIndex].Next(ctx)
@@ -265,8 +226,6 @@ func (o *functionOperator) Next(ctx context.Context) ([]model.StepVector, error)
 			}
 		}
 	}
-
-	o.AddExecutionTimeTaken(time.Since(start))
 
 	return vectors, nil
 }
