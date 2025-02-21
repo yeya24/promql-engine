@@ -11,14 +11,12 @@ import (
 	"github.com/efficientgo/core/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/promqltest"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/annotations"
 
-	"github.com/prometheus/prometheus/promql/parser"
-
 	"github.com/thanos-io/promql-engine/engine"
 	"github.com/thanos-io/promql-engine/execution/model"
-	engstore "github.com/thanos-io/promql-engine/execution/storage"
 	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
 )
@@ -34,12 +32,11 @@ load 30s
 	http_requests_total{container="a"} 1x30
 	http_requests_total{container="b"} 2x30`
 
-	storage := promql.LoadedStorage(t, load)
+	storage := promqltest.LoadedStorage(t, load)
 	defer storage.Close()
 
 	newEngine := engine.New(engine.Opts{
-		EngineOpts:      opts,
-		DisableFallback: true,
+		EngineOpts: opts,
 		LogicalOptimizers: []logicalplan.Optimizer{
 			&injectVectorSelector{},
 		},
@@ -64,8 +61,8 @@ load 30s
 
 type injectVectorSelector struct{}
 
-func (i injectVectorSelector) Optimize(plan parser.Expr, opts *query.Options) (parser.Expr, annotations.Annotations) {
-	logicalplan.TraverseBottomUp(nil, &plan, func(_, current *parser.Expr) bool {
+func (i injectVectorSelector) Optimize(plan logicalplan.Node, _ *query.Options) (logicalplan.Node, annotations.Annotations) {
+	logicalplan.TraverseBottomUp(nil, &plan, func(_, current *logicalplan.Node) bool {
 		switch t := (*current).(type) {
 		case *logicalplan.VectorSelector:
 			*current = &logicalVectorSelector{
@@ -81,8 +78,8 @@ type logicalVectorSelector struct {
 	*logicalplan.VectorSelector
 }
 
-func (c logicalVectorSelector) MakeExecutionOperator(vectors *model.VectorPool, _ *engstore.SelectorPool, opts *query.Options, hints storage.SelectHints) (model.VectorOperator, error) {
-	return &vectorSelectorOperator{
+func (c logicalVectorSelector) MakeExecutionOperator(_ context.Context, vectors *model.VectorPool, opts *query.Options, _ storage.SelectHints) (model.VectorOperator, error) {
+	oper := &vectorSelectorOperator{
 		stepsBatch: opts.StepsBatch,
 		vectors:    vectors,
 
@@ -90,7 +87,13 @@ func (c logicalVectorSelector) MakeExecutionOperator(vectors *model.VectorPool, 
 		maxt:        opts.End.UnixMilli(),
 		step:        opts.Step.Milliseconds(),
 		currentStep: opts.Start.UnixMilli(),
-	}, nil
+	}
+
+	return oper, nil
+}
+
+func (c vectorSelectorOperator) String() string {
+	return "logicalVectorSelector"
 }
 
 type vectorSelectorOperator struct {
@@ -129,6 +132,6 @@ func (c *vectorSelectorOperator) GetPool() *model.VectorPool {
 	return c.vectors
 }
 
-func (c *vectorSelectorOperator) Explain() (me string, next []model.VectorOperator) {
-	return "vectorSelectorOperator", nil
+func (c *vectorSelectorOperator) Explain() (next []model.VectorOperator) {
+	return nil
 }

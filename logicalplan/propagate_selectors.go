@@ -7,9 +7,8 @@ import (
 	"sort"
 
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/util/annotations"
-
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/thanos-io/promql-engine/query"
 )
@@ -18,9 +17,9 @@ import (
 // two vector selectors in a binary expression.
 type PropagateMatchersOptimizer struct{}
 
-func (m PropagateMatchersOptimizer) Optimize(plan parser.Expr, _ *query.Options) (parser.Expr, annotations.Annotations) {
-	traverse(&plan, func(expr *parser.Expr) {
-		binOp, ok := (*expr).(*parser.BinaryExpr)
+func (m PropagateMatchersOptimizer) Optimize(plan Node, _ *query.Options) (Node, annotations.Annotations) {
+	Traverse(&plan, func(expr *Node) {
+		binOp, ok := (*expr).(*Binary)
 		if !ok {
 			return
 		}
@@ -46,7 +45,7 @@ func (m PropagateMatchersOptimizer) Optimize(plan parser.Expr, _ *query.Options)
 	return plan, nil
 }
 
-func propagateMatchers(binOp *parser.BinaryExpr) {
+func propagateMatchers(binOp *Binary) {
 	lhSelector, ok := binOp.LHS.(*VectorSelector)
 	if !ok {
 		return

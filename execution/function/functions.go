@@ -4,15 +4,11 @@
 package function
 
 import (
-	"fmt"
 	"math"
 	"time"
 
-	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/promql/parser"
-
-	"github.com/thanos-io/promql-engine/execution/parse"
 )
 
 type functionCall func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool)
@@ -57,6 +53,10 @@ var instantVectorFuncs = map[string]functionCall{
 		return sign
 	}),
 	"round": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		if len(vargs) > 1 {
 			return 0., false
 		}
@@ -75,6 +75,10 @@ var instantVectorFuncs = map[string]functionCall{
 		return f, true
 	},
 	"clamp": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		if len(vargs) != 2 {
 			return 0., false
 		}
@@ -90,6 +94,10 @@ var instantVectorFuncs = map[string]functionCall{
 		return math.Max(min, math.Min(max, v)), true
 	},
 	"clamp_min": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		if len(vargs) != 1 {
 			return 0., false
 		}
@@ -100,6 +108,10 @@ var instantVectorFuncs = map[string]functionCall{
 		return math.Max(min, v), true
 	},
 	"clamp_max": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		if len(vargs) != 1 {
 			return 0., false
 		}
@@ -121,6 +133,12 @@ var instantVectorFuncs = map[string]functionCall{
 		}
 		return h.Count, true
 	},
+	"histogram_avg": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h == nil {
+			return 0., false
+		}
+		return h.Sum / h.Count, true
+	},
 	"histogram_fraction": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
 		if h == nil || len(vargs) != 2 {
 			return 0., false
@@ -129,29 +147,76 @@ var instantVectorFuncs = map[string]functionCall{
 	},
 	// variants of date time functions with an argument
 	"days_in_month": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return daysInMonth(dateFromSampleValue(f)), true
 	},
 	"day_of_month": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return dayOfMonth(dateFromSampleValue(f)), true
 	},
 	"day_of_week": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return dayOfWeek(dateFromSampleValue(f)), true
 	},
 	"day_of_year": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return dayOfYear(dateFromSampleValue(f)), true
 	},
 	"hour": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return hour(dateFromSampleValue(f)), true
 	},
 	"minute": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return minute(dateFromSampleValue(f)), true
 	},
 	"month": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return month(dateFromSampleValue(f)), true
 	},
 	"year": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+
 		return year(dateFromSampleValue(f)), true
 	},
+	// hack we only have sort functions as argument for "timestamp" possibly so they dont actually
+	// need to sort anything. This is only for compatibility to prometheus as this sort of query does
+	// not make too much sense.
+	"sort": simpleFunc(func(v float64) float64 {
+		return v
+	}),
+	"sort_desc": simpleFunc(func(v float64) float64 {
+		return v
+	}),
+	"sort_by_label": simpleFunc(func(v float64) float64 {
+		return v
+	}),
+	"sort_by_label_desc": simpleFunc(func(v float64) float64 {
+		return v
+	}),
 }
 
 type noArgFunctionCall func(t int64) float64
@@ -192,6 +257,9 @@ var noArgFuncs = map[string]noArgFunctionCall{
 
 func simpleFunc(f func(float64) float64) functionCall {
 	return func(v float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
 		return f(v), true
 	}
 }
@@ -258,13 +326,4 @@ var XFunctions = map[string]*parser.Function{
 func IsExtFunction(functionName string) bool {
 	_, ok := XFunctions[functionName]
 	return ok
-}
-
-func UnknownFunctionError(name string) error {
-	msg := fmt.Sprintf("unknown function: %s", name)
-	if _, ok := parser.Functions[name]; ok {
-		return errors.Wrap(parse.ErrNotImplemented, msg)
-	}
-
-	return errors.Wrap(parse.ErrNotSupportedExpr, msg)
 }

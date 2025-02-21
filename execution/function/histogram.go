@@ -11,12 +11,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+
 	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/warnings"
 	"github.com/thanos-io/promql-engine/extlabels"
+	"github.com/thanos-io/promql-engine/logicalplan"
+	"github.com/thanos-io/promql-engine/query"
 )
 
 type histogramSeries struct {
@@ -27,12 +33,12 @@ type histogramSeries struct {
 
 // histogramOperator is a function operator that calculates percentiles.
 type histogramOperator struct {
-	pool *model.VectorPool
+	telemetry.OperatorTelemetry
+	once   sync.Once
+	series []labels.Labels
 
-	funcArgs parser.Expressions
-
-	once     sync.Once
-	series   []labels.Labels
+	pool     *model.VectorPool
+	funcArgs logicalplan.Nodes
 	scalarOp model.VectorOperator
 	vectorOp model.VectorOperator
 
@@ -46,27 +52,39 @@ type histogramOperator struct {
 
 	// seriesBuckets are the buckets for each individual conventional histogram series.
 	seriesBuckets []buckets
-	model.OperatorTelemetry
 }
 
-func (o *histogramOperator) Analyze() (model.OperatorTelemetry, []model.ObservableVectorOperator) {
-	o.SetName("[*functionOperator]")
-	next := make([]model.ObservableVectorOperator, 0, 2)
-	if obsScalarOp, ok := o.scalarOp.(model.ObservableVectorOperator); ok {
-		next = append(next, obsScalarOp)
+func newHistogramOperator(
+	pool *model.VectorPool,
+	funcArgs logicalplan.Nodes,
+	scalarOp model.VectorOperator,
+	vectorOp model.VectorOperator,
+	opts *query.Options,
+) *histogramOperator {
+	oper := &histogramOperator{
+		pool:         pool,
+		funcArgs:     funcArgs,
+		scalarOp:     scalarOp,
+		vectorOp:     vectorOp,
+		scalarPoints: make([]float64, opts.StepsBatch),
 	}
-	if obsVectorOp, ok := o.vectorOp.(model.ObservableVectorOperator); ok {
-		next = append(next, obsVectorOp)
-	}
-	return o, next
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
+
+	return oper
 }
 
-func (o *histogramOperator) Explain() (me string, next []model.VectorOperator) {
-	next = []model.VectorOperator{o.scalarOp, o.vectorOp}
-	return fmt.Sprintf("[*functionOperator] histogram_quantile(%v)", o.funcArgs), next
+func (o *histogramOperator) String() string {
+	return fmt.Sprintf("[histogram_quantile](%v)", o.funcArgs)
+}
+
+func (o *histogramOperator) Explain() (next []model.VectorOperator) {
+	return []model.VectorOperator{o.scalarOp, o.vectorOp}
 }
 
 func (o *histogramOperator) Series(ctx context.Context) ([]labels.Labels, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	var err error
 	o.once.Do(func() { err = o.loadSeries(ctx) })
 	if err != nil {
@@ -81,12 +99,15 @@ func (o *histogramOperator) GetPool() *model.VectorPool {
 }
 
 func (o *histogramOperator) Next(ctx context.Context) ([]model.StepVector, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	start := time.Now()
+
 	var err error
 	o.once.Do(func() { err = o.loadSeries(ctx) })
 	if err != nil {
@@ -110,17 +131,21 @@ func (o *histogramOperator) Next(ctx context.Context) ([]model.StepVector, error
 	o.scalarPoints = o.scalarPoints[:0]
 	for _, scalar := range scalars {
 		if len(scalar.Samples) > 0 {
-			o.scalarPoints = append(o.scalarPoints, scalar.Samples[0])
+			sample := scalar.Samples[0]
+			if math.IsNaN(sample) || sample < 0 || sample > 1 {
+				warnings.AddToContext(annotations.NewInvalidQuantileWarning(sample, posrange.PositionRange{}), ctx)
+			}
+			o.scalarPoints = append(o.scalarPoints, sample)
 		}
 		o.scalarOp.GetPool().PutStepVector(scalar)
 	}
 	o.scalarOp.GetPool().PutVectors(scalars)
-	o.AddExecutionTimeTaken(time.Since(start))
 
-	return o.processInputSeries(vectors)
+	return o.processInputSeries(ctx, vectors)
 }
 
-func (o *histogramOperator) processInputSeries(vectors []model.StepVector) ([]model.StepVector, error) {
+// nolint: unparam
+func (o *histogramOperator) processInputSeries(ctx context.Context, vectors []model.StepVector) ([]model.StepVector, error) {
 	out := o.pool.GetVectorBatch()
 	for stepIndex, vector := range vectors {
 		o.resetBuckets()
@@ -166,8 +191,11 @@ func (o *histogramOperator) processInputSeries(vectors []model.StepVector) ([]mo
 				continue
 			}
 
-			val := bucketQuantile(o.scalarPoints[stepIndex], stepBuckets)
+			val, forcedMonotonicity, _ := bucketQuantile(o.scalarPoints[stepIndex], stepBuckets)
 			step.AppendSample(o.pool, uint64(i), val)
+			if forcedMonotonicity {
+				warnings.AddToContext(annotations.NewHistogramQuantileForcedMonotonicityInfo("", posrange.PositionRange{}), ctx)
+			}
 		}
 
 		out = append(out, step)

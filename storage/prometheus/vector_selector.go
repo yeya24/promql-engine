@@ -1,7 +1,7 @@
 // Copyright (c) The Thanos Community Authors.
 // Licensed under the Apache License 2.0.
 
-package scan
+package prometheus
 
 import (
 	"context"
@@ -9,17 +9,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/efficientgo/core/errors"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 
-	"github.com/thanos-io/promql-engine/execution/model"
-	engstore "github.com/thanos-io/promql-engine/execution/storage"
-	"github.com/thanos-io/promql-engine/query"
+	"github.com/efficientgo/core/errors"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/query"
 )
 
 type vectorScanner struct {
@@ -29,9 +30,9 @@ type vectorScanner struct {
 }
 
 type vectorSelector struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
-	storage  engstore.SeriesSelector
+	storage  SeriesSelector
 	scanners []vectorScanner
 	series   []labels.Labels
 
@@ -52,23 +53,22 @@ type vectorSelector struct {
 	shard     int
 	numShards int
 
-	pushedDownTimestampFunction bool
+	selectTimestamp bool
 }
 
 // NewVectorSelector creates operator which selects vector of series.
 func NewVectorSelector(
 	pool *model.VectorPool,
-	selector engstore.SeriesSelector,
+	selector SeriesSelector,
 	queryOpts *query.Options,
 	offset time.Duration,
-	hints storage.SelectHints,
 	batchSize int64,
+	selectTimestamp bool,
 	shard, numShards int,
 ) model.VectorOperator {
 	o := &vectorSelector{
-		OperatorTelemetry: &model.NoopTelemetry{},
-		storage:           selector,
-		vectorPool:        pool,
+		storage:    selector,
+		vectorPool: pool,
 
 		mint:            queryOpts.Start.UnixMilli(),
 		maxt:            queryOpts.End.UnixMilli(),
@@ -82,11 +82,10 @@ func NewVectorSelector(
 		shard:     shard,
 		numShards: numShards,
 
-		pushedDownTimestampFunction: hints.Func == "timestamp",
+		selectTimestamp: selectTimestamp,
 	}
-	if queryOpts.EnableAnalysis {
-		o.OperatorTelemetry = &model.TrackedTelemetry{}
-	}
+	o.OperatorTelemetry = telemetry.NewTelemetry(o, queryOpts)
+
 	// For instant queries, set the step to a positive value
 	// so that the operator can terminate.
 	if o.step == 0 {
@@ -96,16 +95,18 @@ func NewVectorSelector(
 	return o
 }
 
-func (o *vectorSelector) Analyze() (model.OperatorTelemetry, []model.ObservableVectorOperator) {
-	o.SetName("[*vectorSelector]")
-	return o, nil
+func (o *vectorSelector) String() string {
+	return fmt.Sprintf("[vectorSelector] {%v} %v mod %v", o.storage.Matchers(), o.shard, o.numShards)
 }
 
-func (o *vectorSelector) Explain() (me string, next []model.VectorOperator) {
-	return fmt.Sprintf("[*vectorSelector] {%v} %v mod %v", o.storage.Matchers(), o.shard, o.numShards), nil
+func (o *vectorSelector) Explain() (next []model.VectorOperator) {
+	return nil
 }
 
 func (o *vectorSelector) Series(ctx context.Context) ([]labels.Labels, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	if err := o.loadSeries(ctx); err != nil {
 		return nil, err
 	}
@@ -117,6 +118,9 @@ func (o *vectorSelector) GetPool() *model.VectorPool {
 }
 
 func (o *vectorSelector) Next(ctx context.Context) ([]model.StepVector, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -126,8 +130,6 @@ func (o *vectorSelector) Next(ctx context.Context) ([]model.StepVector, error) {
 		return nil, nil
 	}
 
-	start := time.Now()
-	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
 	if err := o.loadSeries(ctx); err != nil {
 		return nil, err
 	}
@@ -139,6 +141,7 @@ func (o *vectorSelector) Next(ctx context.Context) ([]model.StepVector, error) {
 		ts += o.step
 	}
 
+	var currStepSamples uint64
 	// Reset the current timestamp.
 	ts = o.currentStep
 	fromSeries := o.currentSeries
@@ -148,20 +151,23 @@ func (o *vectorSelector) Next(ctx context.Context) ([]model.StepVector, error) {
 			seriesTs = ts
 		)
 		for currStep := 0; currStep < o.numSteps && seriesTs <= o.maxt; currStep++ {
+			currStepSamples = 0
 			t, v, h, ok, err := selectPoint(series.samples, seriesTs, o.lookbackDelta, o.offset)
 			if err != nil {
 				return nil, err
 			}
-			if o.pushedDownTimestampFunction {
+			if o.selectTimestamp {
 				v = float64(t) / 1000
 			}
 			if ok {
-				if h != nil && !o.pushedDownTimestampFunction {
+				if h != nil && !o.selectTimestamp {
 					vectors[currStep].AppendHistogram(o.vectorPool, series.signature, h)
 				} else {
 					vectors[currStep].AppendSample(o.vectorPool, series.signature, v)
 				}
+				currStepSamples++
 			}
+			o.IncrementSamplesAtTimestamp(int(currStepSamples), seriesTs)
 			seriesTs += o.step
 		}
 	}
@@ -193,7 +199,7 @@ func (o *vectorSelector) loadSeries(ctx context.Context) error {
 			b.Reset(s.Labels())
 			// if we have pushed down a timestamp function into the scan we need to drop
 			// the __name__ label
-			if o.pushedDownTimestampFunction {
+			if o.selectTimestamp {
 				b.Del(labels.MetricName)
 			}
 			o.series[i] = b.Labels()
@@ -231,13 +237,12 @@ func selectPoint(it *storage.MemoizedSeriesIterator, ts, lookbackDelta, offset i
 	if valueType == chunkenc.ValNone || t > refTime {
 		var ok bool
 		t, v, fh, ok = it.PeekPrev()
-		if !ok || t < refTime-lookbackDelta {
+		if !ok || t <= refTime-lookbackDelta {
 			return 0, 0, nil, false, nil
 		}
 	}
 	if value.IsStaleNaN(v) || (fh != nil && value.IsStaleNaN(fh.Sum)) {
 		return 0, 0, nil, false, nil
 	}
-
 	return t, v, fh, true, nil
 }

@@ -4,15 +4,19 @@
 package aggregate
 
 import (
+	"context"
 	"fmt"
 	"math"
 
 	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/thanos-io/promql-engine/execution/model"
 	"github.com/thanos-io/promql-engine/execution/parse"
+	"github.com/thanos-io/promql-engine/execution/warnings"
 )
 
 type vectorTable struct {
@@ -44,21 +48,25 @@ func (t *vectorTable) timestamp() int64 {
 	return t.ts
 }
 
-func (t *vectorTable) aggregate(vector model.StepVector) {
+func (t *vectorTable) aggregate(ctx context.Context, vector model.StepVector) error {
 	t.ts = vector.T
-	t.accumulator.AddVector(vector.Samples, vector.Histograms)
+	return t.accumulator.AddVector(ctx, vector.Samples, vector.Histograms)
 }
 
-func (t *vectorTable) toVector(pool *model.VectorPool) model.StepVector {
+func (t *vectorTable) toVector(ctx context.Context, pool *model.VectorPool) model.StepVector {
 	result := pool.GetStepVector(t.ts)
-	if !t.accumulator.HasValue() {
+	switch t.accumulator.ValueType() {
+	case NoValue:
 		return result
-	}
-	v, h := t.accumulator.Value()
-	if h == nil {
-		result.AppendSample(pool, 0, v)
-	} else {
-		result.AppendHistogram(pool, 0, h)
+	case SingleTypeValue:
+		v, h := t.accumulator.Value()
+		if h == nil {
+			result.AppendSample(pool, 0, v)
+		} else {
+			result.AppendHistogram(pool, 0, h)
+		}
+	case MixedTypeValue:
+		warnings.AddToContext(annotations.NewMixedFloatsHistogramsAggWarning(posrange.PositionRange{}), ctx)
 	}
 	return result
 }
@@ -88,12 +96,12 @@ func newVectorAccumulator(expr parser.ItemType) (vectorAccumulator, error) {
 	return nil, errors.Wrap(parse.ErrNotSupportedExpr, msg)
 }
 
-func histogramSum(current *histogram.FloatHistogram, histograms []*histogram.FloatHistogram) *histogram.FloatHistogram {
+func histogramSum(ctx context.Context, current *histogram.FloatHistogram, histograms []*histogram.FloatHistogram) (*histogram.FloatHistogram, error) {
 	if len(histograms) == 0 {
-		return current
+		return current, nil
 	}
 	if current == nil && len(histograms) == 1 {
-		return histograms[0].Copy()
+		return histograms[0].Copy(), nil
 	}
 	var histSum *histogram.FloatHistogram
 	if current != nil {
@@ -103,14 +111,35 @@ func histogramSum(current *histogram.FloatHistogram, histograms []*histogram.Flo
 		histograms = histograms[1:]
 	}
 
+	var err error
 	for i := 0; i < len(histograms); i++ {
 		if histograms[i].Schema >= histSum.Schema {
-			histSum = histSum.Add(histograms[i])
+			histSum, err = histSum.Add(histograms[i])
+			if err != nil {
+				if errors.Is(err, histogram.ErrHistogramsIncompatibleSchema) {
+					warnings.AddToContext(annotations.NewMixedExponentialCustomHistogramsWarning("", posrange.PositionRange{}), ctx)
+					return nil, nil
+				}
+				if errors.Is(err, histogram.ErrHistogramsIncompatibleBounds) {
+					warnings.AddToContext(annotations.NewIncompatibleCustomBucketsHistogramsWarning("", posrange.PositionRange{}), ctx)
+					return nil, nil
+				}
+				return nil, err
+			}
 		} else {
 			t := histograms[i].Copy()
-			t.Add(histSum)
-			histSum = t
+			if histSum, err = t.Add(histSum); err != nil {
+				if errors.Is(err, histogram.ErrHistogramsIncompatibleSchema) {
+					warnings.AddToContext(annotations.NewMixedExponentialCustomHistogramsWarning("", posrange.PositionRange{}), ctx)
+					return nil, nil
+				}
+				if errors.Is(err, histogram.ErrHistogramsIncompatibleBounds) {
+					warnings.AddToContext(annotations.NewIncompatibleCustomBucketsHistogramsWarning("", posrange.PositionRange{}), ctx)
+					return nil, nil
+				}
+				return nil, err
+			}
 		}
 	}
-	return histSum
+	return histSum, nil
 }

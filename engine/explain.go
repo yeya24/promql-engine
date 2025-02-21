@@ -4,9 +4,13 @@
 package engine
 
 import (
+	"sync"
+
 	"github.com/prometheus/prometheus/promql"
 
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/logicalplan"
 )
 
 type ExplainableQuery interface {
@@ -17,8 +21,13 @@ type ExplainableQuery interface {
 }
 
 type AnalyzeOutputNode struct {
-	OperatorTelemetry model.OperatorTelemetry `json:"telemetry,omitempty"`
-	Children          []AnalyzeOutputNode     `json:"children,omitempty"`
+	OperatorTelemetry telemetry.OperatorTelemetry `json:"telemetry,omitempty"`
+	Children          []*AnalyzeOutputNode        `json:"children,omitempty"`
+
+	once                sync.Once
+	totalSamples        int64
+	peakSamples         int64
+	totalSamplesPerStep []int64
 }
 
 type ExplainOutputNode struct {
@@ -28,22 +37,69 @@ type ExplainOutputNode struct {
 
 var _ ExplainableQuery = &compatibilityQuery{}
 
-func analyzeVector(obsv model.ObservableVectorOperator) *AnalyzeOutputNode {
-	telemetry, obsVectors := obsv.Analyze()
+func (a *AnalyzeOutputNode) TotalSamples() int64 {
+	a.aggregateSamples()
+	return a.totalSamples
+}
 
-	var children []AnalyzeOutputNode
-	for _, vector := range obsVectors {
-		children = append(children, *analyzeVector(vector))
+func (a *AnalyzeOutputNode) TotalSamplesPerStep() []int64 {
+	a.aggregateSamples()
+	return a.totalSamplesPerStep
+}
+
+func (a *AnalyzeOutputNode) PeakSamples() int64 {
+	a.aggregateSamples()
+	return a.peakSamples
+}
+
+func (a *AnalyzeOutputNode) aggregateSamples() {
+	a.once.Do(func() {
+		if nodeSamples := a.OperatorTelemetry.Samples(); nodeSamples != nil {
+			a.totalSamples += nodeSamples.TotalSamples
+			a.peakSamples += int64(nodeSamples.PeakSamples)
+			a.totalSamplesPerStep = nodeSamples.TotalSamplesPerStep
+		}
+
+		for _, child := range a.Children {
+			childPeak := child.PeakSamples()
+			a.peakSamples = max(a.peakSamples, childPeak)
+
+			switch a.OperatorTelemetry.LogicalNode().(type) {
+			case *logicalplan.Subquery:
+				// Skip aggregating samples for subquery
+			case *logicalplan.StepInvariantExpr:
+				childSamples := child.TotalSamples()
+				for i := 0; i < len(a.totalSamplesPerStep); i++ {
+					a.totalSamples += childSamples
+					a.totalSamplesPerStep[i] += childSamples
+				}
+			default:
+				a.totalSamples += child.TotalSamples()
+				for i, s := range child.TotalSamplesPerStep() {
+					a.totalSamplesPerStep[i] += s
+				}
+			}
+		}
+	})
+}
+
+func analyzeQuery(obsv telemetry.ObservableVectorOperator) *AnalyzeOutputNode {
+	children := obsv.Explain()
+	var childTelemetry []*AnalyzeOutputNode
+	for _, child := range children {
+		if obsChild, ok := child.(telemetry.ObservableVectorOperator); ok {
+			childTelemetry = append(childTelemetry, analyzeQuery(obsChild))
+		}
 	}
 
 	return &AnalyzeOutputNode{
-		OperatorTelemetry: telemetry,
-		Children:          children,
+		OperatorTelemetry: obsv,
+		Children:          childTelemetry,
 	}
 }
 
 func explainVector(v model.VectorOperator) *ExplainOutputNode {
-	name, vectors := v.Explain()
+	vectors := v.Explain()
 
 	var children []ExplainOutputNode
 	for _, vector := range vectors {
@@ -51,7 +107,7 @@ func explainVector(v model.VectorOperator) *ExplainOutputNode {
 	}
 
 	return &ExplainOutputNode{
-		OperatorName: name,
+		OperatorName: v.String(),
 		Children:     children,
 	}
 }

@@ -31,18 +31,29 @@ help: ## Displays help.
 
 .PHONY: test
 test: ## Runs all Go unit tests.
-	@export GOCACHE=/tmp/cache
 	@echo ">> running unit tests (without cache)"
-	@rm -rf $(GOCACHE)
-	@go test -race -timeout=10m $(GOMODULES);
+	@rm -rf /tmp/engine-cache
+	@GORACE=atexit_sleep_ms=0 GOCACHE=/tmp/engine-cache go test -race -timeout=10m $(GOMODULES);
 
+.PHONY: test-fast
+test-fast: ## Runs all Go unit tests without race detector.
+	@echo ">> running unit tests without race detection (with cache)"
+	@go test -count=1 -timeout=10m $(GOMODULES);
 
 .PHONY: test-stringlabels
 test-stringlabels: ## Runs all Go unit tests with stringlabels flag.
 	@export GOCACHE=/tmp/cache
-	@echo ">> stringlabels: running unit tests (without cache)"
+	@echo ">> running unit tests with stringlabels flag (without cache)"
 	@rm -rf $(GOCACHE)
 	@go test -race --tags=stringlabels -timeout=10m $(GOMODULES);
+
+.PHONY: fuzz
+fuzz: ## Runs selected fuzzing tests
+	@export GOCACHE=/tmp/cache
+	@echo ">> running fuzz tests (without cache)"
+	@rm -rf $(GOCACHE)
+	@go test github.com/thanos-io/promql-engine/engine -run None -fuzz FuzzEnginePromQLSmithInstantQuery -fuzztime=90s -fuzzminimizetime 0x;
+	@go test github.com/thanos-io/promql-engine/logicalplan -run None -fuzz FuzzNodesMarshalJSON -fuzztime=30s -fuzzminimizetime 0x;
 
 .PHONY: deps
 deps: ## Ensures fresh go.mod and go.sum.
@@ -68,6 +79,9 @@ check-docs: $(MDOX)
 format: $(GOIMPORTS)
 	@echo ">> formatting go code"
 	@gofmt -s -w $(FILES_TO_FMT)
+	@echo ">> formatting promql tests"
+	@go run scripts/testvet/main.go -json -fix ./...
+	@echo ">> formatting imports"
 	@$(GOIMPORTS) -w $(FILES_TO_FMT)
 
 .PHONY:lint
@@ -79,7 +93,7 @@ lint: format deps $(GOLANGCI_LINT) $(FAILLINT) $(COPYRIGHT) docs
 fmt.{Errorf}=github.com/efficientgo/core/errors.{Wrap,Wrapf},\
 github.com/prometheus/prometheus/pkg/testutils=github.com/efficientgo/core/testutil,\
 github.com/stretchr/testify=github.com/efficientgo/core/testutil" $(GOMODULES)
-	@$(FAILLINT) -paths "fmt.{Print,Println,Sprint,Errorf}" -ignore-tests $(GOMODULES)
+	@$(FAILLINT) -paths "fmt.{Print,Println,Errorf}" -ignore-tests $(GOMODULES)
 	@echo ">> linting all of the Go files GOGC=${GOGC}"
 	@$(GOLANGCI_LINT) run
 	@echo ">> ensuring Copyright headers"
@@ -110,16 +124,3 @@ bench-new: benchmarks
 .PHONY: benchmark
 benchmark: bench-old bench-new
 	@benchstat benchmarks/old.out benchmarks/new.out
-
-.PHONY: sync-parser
-sync-parser:
-	@echo "Cleaning existing directories"
-	@rm -rf parser
-	@mkdir -p tmp
-	@rm -rf tmp/prometheus
-	@echo "Cloning prometheus"
-	@git clone git@github.com:prometheus/prometheus.git tmp/prometheus
-	@echo "Copying parser"
-	cp -r tmp/prometheus/promql/parser .
-	@echo "Cleaning up"
-	@rm -rf tmp

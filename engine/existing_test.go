@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/promqltest"
 )
 
 func TestRangeQuery(t *testing.T) {
@@ -29,8 +30,23 @@ func TestRangeQuery(t *testing.T) {
 		{
 			Name: "sum_over_time with all values",
 			Load: `load 30s
-              bar 0 1 10 100 1000`,
-			Query: "sum_over_time(bar[30s])",
+			    bar 0 1 10 100 1000`,
+			Query: `sum_over_time(bar[30s])`,
+			Result: promql.Matrix{
+				promql.Series{
+					Floats: []promql.FPoint{{F: 0, T: 0}, {F: 10, T: 60000}, {F: 1000, T: 120000}},
+					Metric: labels.Labels{},
+				},
+			},
+			Start:    time.Unix(0, 0),
+			End:      time.Unix(120, 0),
+			Interval: 60 * time.Second,
+		},
+		{
+			Name: "sum_over_time with all values",
+			Load: `load 30s
+			    bar 0 1 10 100 1000`,
+			Query: `sum_over_time(bar[45s])`,
 			Result: promql.Matrix{
 				promql.Series{
 					Floats: []promql.FPoint{{F: 0, T: 0}, {F: 11, T: 60000}, {F: 1100, T: 120000}},
@@ -44,8 +60,8 @@ func TestRangeQuery(t *testing.T) {
 		{
 			Name: "sum_over_time with trailing values",
 			Load: `load 30s
-              bar 0 1 10 100 1000 0 0 0 0`,
-			Query: "sum_over_time(bar[30s])",
+			    bar 0 1 10 100 1000 0 0 0 0`,
+			Query: `sum_over_time(bar[45s])`,
 			Result: promql.Matrix{
 				promql.Series{
 					Floats: []promql.FPoint{{F: 0, T: 0}, {F: 11, T: 60000}, {F: 1100, T: 120000}},
@@ -59,8 +75,8 @@ func TestRangeQuery(t *testing.T) {
 		{
 			Name: "sum_over_time with all values long",
 			Load: `load 30s
-              bar 0 1 10 100 1000 10000 100000 1000000 10000000`,
-			Query: "sum_over_time(bar[30s])",
+			    bar 0 1 10 100 1000 10000 100000 1000000 10000000`,
+			Query: `sum_over_time(bar[45s])`,
 			Result: promql.Matrix{
 				promql.Series{
 					Floats: []promql.FPoint{{F: 0, T: 0}, {F: 11, T: 60000}, {F: 1100, T: 120000}, {F: 110000, T: 180000}, {F: 11000000, T: 240000}},
@@ -74,8 +90,8 @@ func TestRangeQuery(t *testing.T) {
 		{
 			Name: "sum_over_time with all values random",
 			Load: `load 30s
-              bar 5 17 42 2 7 905 51`,
-			Query: "sum_over_time(bar[30s])",
+			    bar 5 17 42 2 7 905 51`,
+			Query: `sum_over_time(bar[45s])`,
 			Result: promql.Matrix{
 				promql.Series{
 					Floats: []promql.FPoint{{F: 5, T: 0}, {F: 59, T: 60000}, {F: 9, T: 120000}, {F: 956, T: 180000}},
@@ -89,8 +105,8 @@ func TestRangeQuery(t *testing.T) {
 		{
 			Name: "metric query",
 			Load: `load 30s
-              metric 1+1x4`,
-			Query: "metric",
+			    metric 1+1x4`,
+			Query: `metric`,
 			Result: promql.Matrix{
 				promql.Series{
 					Floats: []promql.FPoint{{F: 1, T: 0}, {F: 3, T: 60000}, {F: 5, T: 120000}},
@@ -104,8 +120,8 @@ func TestRangeQuery(t *testing.T) {
 		{
 			Name: "metric query with trailing values",
 			Load: `load 30s
-              metric 1+1x8`,
-			Query: "metric",
+			    metric 1+1x8`,
+			Query: `metric`,
 			Result: promql.Matrix{
 				promql.Series{
 					Floats: []promql.FPoint{{F: 1, T: 0}, {F: 3, T: 60000}, {F: 5, T: 120000}},
@@ -122,10 +138,10 @@ func TestRangeQuery(t *testing.T) {
 		Timeout: 1 * time.Hour,
 	}
 	ng := engine.New(engine.Opts{EngineOpts: opts})
-
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
-			storage := promql.LoadedStorage(t, c.Load)
+			t.Parallel()
+			storage := promqltest.LoadedStorage(t, c.Load)
 			defer storage.Close()
 
 			qry, err := ng.NewRangeQuery(context.Background(), storage, nil, c.Query, c.Start, c.End, c.Interval)

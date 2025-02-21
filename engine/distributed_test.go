@@ -51,14 +51,7 @@ func (p partition) mint() int64 {
 }
 
 func TestDistributedAggregations(t *testing.T) {
-	localOpts := engine.Opts{
-		EngineOpts: promql.EngineOpts{
-			Timeout:              1 * time.Hour,
-			MaxSamples:           1e10,
-			EnableNegativeOffset: true,
-			EnableAtModifier:     true,
-		},
-	}
+	t.Parallel()
 
 	instantTSs := []time.Time{
 		time.Unix(75, 0),
@@ -200,17 +193,22 @@ func TestDistributedAggregations(t *testing.T) {
 	}
 
 	queries := []struct {
-		name           string
-		query          string
-		expectFallback bool
+		name       string
+		query      string
+		rangeStart time.Time
 	}{
+		{name: "binop with selector and constant series", query: `bar or on () vector(0)`},
+		{name: "binop with aggregation and constant series", query: `sum(bar) or on () vector(0)`},
 		{name: "sum", query: `sum by (pod) (bar)`},
 		{name: "sum by __name__", query: `sum by (__name__) ({__name__=~".+"})`},
 		{name: "parenthesis", query: `sum by (pod) ((bar))`},
 		{name: "avg", query: `avg(bar)`},
 		{name: "avg by __name__", query: `avg by (__name__) ({__name__=~".+"})`},
-		{name: "avg with grouping", query: `avg by (pod) (bar)`},
-		{name: "label_replace", query: `max by (instance) (label_replace(bar, "instance", "$1", "pod", "(.*)"))`},
+		{name: "avg with by-grouping", query: `avg by (pod) (bar)`},
+		{name: "avg with without-grouping", query: `avg without (pod) (bar)`},
+		{name: "label_replace", query: `max by (instance) (label_replace(bar, "instance", "$1", "pod", ".*"))`},
+		{name: "label_replace to ext label before aggregation", query: `max(sum(label_replace(bar, "zone", "hardcoded-zone", "zone", "(.*)")))`},
+		{name: "label_replace to ext label after aggregation", query: `max(label_replace(sum by (zone) (bar), "zone", "hardcoded-zone", "zone", ".*"))`},
 		{name: "count", query: `count by (pod) (bar)`},
 		{name: "count by __name__", query: `count by (__name__) ({__name__=~".+"})`},
 		{name: "group", query: `group by (pod) (bar)`},
@@ -227,15 +225,31 @@ func TestDistributedAggregations(t *testing.T) {
 		{name: "binary nested with constants", query: `(1 + 2) + (1 atan2 (-1 % -1))`},
 		{name: "binary nested with functions", query: `(1 + exp(vector(1))) + (1 atan2 (-1 % -1))`},
 		{name: "filtered selector interaction", query: `sum by (region) (bar{region="east"}) / sum by (region) (bar)`},
-		{name: "unsupported aggregation", query: `count_values("pod", bar)`, expectFallback: true},
+		{name: "unsupported aggregation", query: `count_values("pod", bar)`},
 		{name: "absent_over_time for non-existing metric", query: `absent_over_time(foo[2m])`},
 		{name: "absent_over_time for existing metric", query: `absent_over_time(bar{pod="nginx-1"}[2m])`},
 		{name: "absent for non-existing metric", query: `absent(foo)`},
 		{name: "absent for existing metric with aggregation", query: `sum(absent(foo))`},
 		{name: "absent for existing metric", query: `absent(bar{pod="nginx-1"})`},
 		{name: "absent for existing metric with aggregation", query: `sum(absent(bar{pod="nginx-1"}))`},
-		{name: "subquery with window within engine range", query: `max_over_time(sum_over_time(bar[30s])[30s:15s])`, expectFallback: true},
-		{name: "subquery with window outside of engine range", query: `max_over_time(sum_over_time(bar[1m])[10m:1m])`, expectFallback: true},
+		{name: "subquery with sum/count", query: `max_over_time((sum(bar) / count(bar))[30s:15s])`},
+		{name: "subquery with avg", query: `max_over_time(avg(bar)[30s:15s])`},
+		{name: "subquery with window within engine range", query: `max_over_time(sum_over_time(bar[30s])[30s:15s])`},
+		{name: "subquery with window outside of engine range", query: `max_over_time(sum_over_time(bar[1m])[10m:1m])`},
+		{name: "subquery with misaligned ranges", rangeStart: time.Unix(7, 0), query: `max_over_time(sum(bar)[30s:15s])`},
+		{name: "subquery with misaligned ranges", rangeStart: time.Unix(7, 0), query: `max_over_time(sum(sum(bar))[30s:15s])`},
+		{name: "nested subqueries",
+			rangeStart: time.Unix(7, 0),
+			query:      `max_over_time(min_over_time(sum(bar)[15s:15s])[15s:15s])`,
+		},
+		{name: "subquery over distributed binary expression", query: `max_over_time((bar / bar)[30s:15s])`},
+		{name: "timestamp", query: `timestamp(bar)`},
+		{name: "timestamp - step invariant", query: `timestamp(bar @ 6000.000)`},
+		{name: "query with @start() absolute timestamp", query: `sum(bar @ start())`},
+		{name: "query with @end() timestamp", query: `sum(bar @ end())`},
+		{name: "query with numeric timestamp", query: `sum(bar @ 140.000)`},
+		{name: "query with range and @end() timestamp", query: `sum(count_over_time(bar[1h] @ end()))`},
+		{name: `subquery with @end() timestamp`, query: `bar @ 100.000 - bar @ 150.000`},
 	}
 
 	lookbackDeltas := []time.Duration{0, 30 * time.Second, 5 * time.Minute}
@@ -246,39 +260,51 @@ func TestDistributedAggregations(t *testing.T) {
 
 	for _, query := range queries {
 		t.Run(query.name, func(t *testing.T) {
+			t.Parallel()
 			for _, test := range tests {
+				var allSeries []*mockSeries
+				remoteEngines := make([]api.RemoteEngine, 0, len(test.seriesSets)+1)
+				for _, s := range test.seriesSets {
+					allSeries = append(allSeries, s.series...)
+				}
+				if len(test.timeOverlap.series) > 0 {
+					allSeries = append(allSeries, test.timeOverlap.series...)
+				}
+				completeSeriesSet := storageWithSeries(mergeWithSampleDedup(allSeries)...)
 				t.Run(test.name, func(t *testing.T) {
 					for _, lookbackDelta := range lookbackDeltas {
-						localOpts.LookbackDelta = lookbackDelta
+						localOpts := engine.Opts{
+							EngineOpts: promql.EngineOpts{
+								Timeout:              1 * time.Hour,
+								MaxSamples:           1e10,
+								EnableNegativeOffset: true,
+								EnableAtModifier:     true,
+								LookbackDelta:        lookbackDelta,
+							},
+						}
+
+						for _, s := range test.seriesSets {
+							remoteEngines = append(remoteEngines, engine.NewRemoteEngine(
+								localOpts,
+								storageWithMockSeries(s.series...),
+								s.mint(),
+								s.maxt(),
+								s.extLset,
+							))
+						}
+						if len(test.timeOverlap.series) > 0 {
+							remoteEngines = append(remoteEngines, engine.NewRemoteEngine(
+								localOpts,
+								storageWithMockSeries(test.timeOverlap.series...),
+								test.timeOverlap.mint(),
+								test.timeOverlap.maxt(),
+								test.timeOverlap.extLset,
+							))
+						}
+
 						for _, queryOpts := range allQueryOpts {
-							var allSeries []*mockSeries
-							remoteEngines := make([]api.RemoteEngine, 0, len(test.seriesSets)+1)
-							for _, s := range test.seriesSets {
-								remoteEngines = append(remoteEngines, engine.NewRemoteEngine(
-									localOpts,
-									storageWithMockSeries(s.series...),
-									s.mint(),
-									s.maxt(),
-									s.extLset,
-								))
-								allSeries = append(allSeries, s.series...)
-							}
-							if len(test.timeOverlap.series) > 0 {
-								remoteEngines = append(remoteEngines, engine.NewRemoteEngine(
-									localOpts,
-									storageWithMockSeries(test.timeOverlap.series...),
-									test.timeOverlap.mint(),
-									test.timeOverlap.maxt(),
-									test.timeOverlap.extLset,
-								))
-								allSeries = append(allSeries, test.timeOverlap.series...)
-							}
-							completeSeriesSet := storageWithSeries(mergeWithSampleDedup(allSeries)...)
-
 							ctx := context.Background()
-
 							distOpts := localOpts
-							distOpts.DisableFallback = !query.expectFallback
 							for _, instantTS := range instantTSs {
 								t.Run(fmt.Sprintf("instant/ts=%d", instantTS.Unix()), func(t *testing.T) {
 									distEngine := engine.NewDistributedEngine(distOpts, api.NewStaticEndpoints(remoteEngines))
@@ -296,16 +322,19 @@ func TestDistributedAggregations(t *testing.T) {
 							}
 
 							t.Run("range", func(t *testing.T) {
+								if query.rangeStart == (time.Time{}) {
+									query.rangeStart = rangeStart
+								}
 								if test.rangeEnd == (time.Time{}) {
 									test.rangeEnd = rangeEnd
 								}
 								distEngine := engine.NewDistributedEngine(distOpts, api.NewStaticEndpoints(remoteEngines))
-								distQry, err := distEngine.NewRangeQuery(ctx, completeSeriesSet, queryOpts, query.query, rangeStart, test.rangeEnd, rangeStep)
+								distQry, err := distEngine.NewRangeQuery(ctx, completeSeriesSet, queryOpts, query.query, query.rangeStart, test.rangeEnd, rangeStep)
 								testutil.Ok(t, err)
 
 								distResult := distQry.Exec(ctx)
 								promEngine := promql.NewEngine(localOpts.EngineOpts)
-								promQry, err := promEngine.NewRangeQuery(ctx, completeSeriesSet, queryOpts, query.query, rangeStart, test.rangeEnd, rangeStep)
+								promQry, err := promEngine.NewRangeQuery(ctx, completeSeriesSet, queryOpts, query.query, query.rangeStart, test.rangeEnd, rangeStep)
 								testutil.Ok(t, err)
 								promResult := promQry.Exec(ctx)
 
@@ -320,6 +349,7 @@ func TestDistributedAggregations(t *testing.T) {
 }
 
 func TestDistributedEngineWarnings(t *testing.T) {
+	t.Parallel()
 	querier := &storage.MockQueryable{
 		MockQuerier: &storage.MockQuerier{
 			SelectMockFunction: func(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
@@ -341,9 +371,52 @@ func TestDistributedEngineWarnings(t *testing.T) {
 		end   = time.UnixMilli(600)
 		step  = 30 * time.Second
 	)
-	q, err := ng.NewRangeQuery(context.Background(), nil, nil, "test", start, end, step)
+	q, err := ng.NewRangeQuery(context.Background(), querier, nil, "test", start, end, step)
 	testutil.Ok(t, err)
 
 	res := q.Exec(context.Background())
 	testutil.Equals(t, 1, len(res.Warnings))
+}
+
+func TestDistributedEnginePartialResponses(t *testing.T) {
+	t.Parallel()
+
+	querierErr := &storage.MockQueryable{
+		MockQuerier: &storage.MockQuerier{
+			SelectMockFunction: func(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+				return newErrorSeriesSet(errors.New("test error"))
+			},
+		},
+	}
+	querierOk := storageWithMockSeries(newMockSeries([]string{labels.MetricName, "foo", "zone", "west"}, []int64{0, 30, 60, 90}, []float64{0, 3, 4, 5}))
+	querierNoop := &storage.MockQueryable{MockQuerier: storage.NoopQuerier()}
+
+	opts := engine.Opts{
+		EnablePartialResponses: true,
+		EngineOpts: promql.EngineOpts{
+			MaxSamples: math.MaxInt64,
+			Timeout:    1 * time.Minute,
+		},
+	}
+
+	remoteErr := engine.NewRemoteEngine(opts, querierErr, math.MinInt64, math.MaxInt64, []labels.Labels{labels.FromStrings("zone", "east")})
+	remoteOk := engine.NewRemoteEngine(opts, querierOk, math.MinInt64, math.MaxInt64, []labels.Labels{labels.FromStrings("zone", "west")})
+	ng := engine.NewDistributedEngine(opts, api.NewStaticEndpoints([]api.RemoteEngine{remoteErr, remoteOk}))
+	var (
+		start = time.UnixMilli(0)
+		end   = time.UnixMilli(600 * 1000)
+		step  = 30 * time.Second
+	)
+	q, err := ng.NewRangeQuery(context.Background(), querierNoop, nil, "sum by (zone) (foo)", start, end, step)
+	testutil.Ok(t, err)
+
+	res := q.Exec(context.Background())
+	testutil.Ok(t, res.Err)
+	testutil.Equals(t, 1, len(res.Warnings))
+	testutil.Equals(t, `remote exec error [[{zone="east"}]]: test error`, res.Warnings.AsErrors()[0].Error())
+
+	m, err := res.Matrix()
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, m.Len())
+	testutil.Equals(t, labels.FromStrings("zone", "west"), m[0].Metric)
 }

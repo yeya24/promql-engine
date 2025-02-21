@@ -5,46 +5,87 @@ package function
 
 import (
 	"context"
+	"sync"
 	"time"
+
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/extlabels"
+	"github.com/thanos-io/promql-engine/query"
 )
 
-type timestampFunctionOperator struct {
+type timestampOperator struct {
 	next model.VectorOperator
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
+
+	series []labels.Labels
+	once   sync.Once
 }
 
-func (o *timestampFunctionOperator) Analyze() (model.OperatorTelemetry, []model.ObservableVectorOperator) {
-	o.SetName("[*timestampFunctionOperator]")
-	next := make([]model.ObservableVectorOperator, 0, 1)
-	if obsnext, ok := o.next.(model.ObservableVectorOperator); ok {
-		next = append(next, obsnext)
+func newTimestampOperator(next model.VectorOperator, opts *query.Options) *timestampOperator {
+	oper := &timestampOperator{
+		next: next,
 	}
-	return o, next
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
+
+	return oper
 }
 
-func (o *timestampFunctionOperator) Explain() (me string, next []model.VectorOperator) {
-	return "[*timestampFunctionOperator]", []model.VectorOperator{}
+func (o *timestampOperator) Explain() (next []model.VectorOperator) {
+	return []model.VectorOperator{o.next}
 }
 
-func (o *timestampFunctionOperator) Series(ctx context.Context) ([]labels.Labels, error) {
-	return o.next.Series(ctx)
+func (o *timestampOperator) Series(ctx context.Context) ([]labels.Labels, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
+	if err := o.loadSeries(ctx); err != nil {
+		return nil, err
+	}
+	return o.series, nil
 }
 
-func (o *timestampFunctionOperator) GetPool() *model.VectorPool {
+func (o *timestampOperator) String() string {
+	return "[timestamp]"
+}
+
+func (o *timestampOperator) loadSeries(ctx context.Context) error {
+	var err error
+	o.once.Do(func() {
+		series, loadErr := o.next.Series(ctx)
+		if loadErr != nil {
+			err = loadErr
+			return
+		}
+		o.series = make([]labels.Labels, len(series))
+
+		b := labels.ScratchBuilder{}
+		for i, s := range series {
+			lbls, _ := extlabels.DropMetricName(s, b)
+			o.series[i] = lbls
+		}
+	})
+
+	return err
+}
+
+func (o *timestampOperator) GetPool() *model.VectorPool {
 	return o.next.GetPool()
 }
 
-func (o *timestampFunctionOperator) Next(ctx context.Context) ([]model.StepVector, error) {
+func (o *timestampOperator) Next(ctx context.Context) ([]model.StepVector, error) {
+	start := time.Now()
+	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
-	start := time.Now()
+
 	in, err := o.next.Next(ctx)
 	if err != nil {
 		return nil, err
@@ -54,6 +95,5 @@ func (o *timestampFunctionOperator) Next(ctx context.Context) ([]model.StepVecto
 			vector.Samples[i] = float64(vector.T / 1000)
 		}
 	}
-	o.OperatorTelemetry.AddExecutionTimeTaken(time.Since(start))
 	return in, nil
 }
