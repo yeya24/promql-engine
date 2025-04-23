@@ -10,6 +10,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/thanos-io/promql-engine/logicalplan"
 )
 
 var sep = []byte{'\xff'}
@@ -27,21 +28,18 @@ func NewSelectorPool(querier storage.Querier) *SelectorPool {
 	}
 }
 
-func (p *SelectorPool) GetSelector(mint, maxt, step int64, matchers []*labels.Matcher, hints storage.SelectHints) SeriesSelector {
-	key := hashMatchers(matchers, mint, maxt, hints)
-	if _, ok := p.selectors[key]; !ok {
-		p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
-	}
-	return p.selectors[key]
-}
-
-func (p *SelectorPool) GetFilteredSelector(mint, maxt, step int64, matchers, filters []*labels.Matcher, hints storage.SelectHints) SeriesSelector {
+func (p *SelectorPool) GetSelector(mint, maxt, step int64, matchers, selectFilters []*labels.Matcher, projectionFilter *logicalplan.Projection, hints storage.SelectHints) SeriesSelector {
 	key := hashMatchers(matchers, mint, maxt, hints)
 	if _, ok := p.selectors[key]; !ok {
 		p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
 	}
 
-	return NewFilteredSelector(p.selectors[key], NewFilter(filters))
+	fs := NewFilteredSelector(p.selectors[key], NewFilter(selectFilters))
+	if projectionFilter == nil || (!projectionFilter.Include && len(projectionFilter.Labels) == 0) {
+		return fs
+	}
+
+	return NewProjectedSelector(fs, projectionFilter)
 }
 
 func hashMatchers(matchers []*labels.Matcher, mint, maxt int64, hints storage.SelectHints) uint64 {

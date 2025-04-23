@@ -6,6 +6,8 @@ package logicalplan
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,14 +68,25 @@ type Projection struct {
 	Include bool
 }
 
+func (p Projection) Equals(other Projection) bool {
+	if p.Include != other.Include {
+		return false
+	}
+
+	sort.Strings(p.Labels)
+	sort.Strings(other.Labels)
+	return slices.Equal(p.Labels, other.Labels)
+}
+
 // VectorSelector is vector selector with additional configuration set by optimizers.
 type VectorSelector struct {
 	*parser.VectorSelector
 	LeafNode
-	Filters         []*labels.Matcher
-	BatchSize       int64
-	SelectTimestamp bool
-	Projection      *Projection
+	Filters          []*labels.Matcher
+	ProjectionFilter *Projection
+	BatchSize        int64
+	SelectTimestamp  bool
+	Projection       *Projection
 	// When set, histogram iterators can return objects which only have their
 	// CounterResetHint, Count and Sum values populated. Histogram buckets and spans
 	// will not be used during query evaluation.

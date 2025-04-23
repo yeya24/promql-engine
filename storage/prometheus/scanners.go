@@ -6,6 +6,7 @@ package prometheus
 import (
 	"context"
 	"math"
+	"sort"
 
 	"github.com/thanos-io/promql-engine/execution/exchange"
 	"github.com/thanos-io/promql-engine/execution/model"
@@ -58,8 +59,8 @@ func (p Scanners) NewVectorSelector(
 		hints.Grouping = logicalNode.Projection.Labels
 		hints.By = logicalNode.Projection.Include
 	}
-
-	selector := p.selectors.GetFilteredSelector(hints.Start, hints.End, opts.Step.Milliseconds(), logicalNode.VectorSelector.LabelMatchers, logicalNode.Filters, hints)
+	sort.Strings(hints.Grouping)
+	selector := p.selectors.GetSelector(hints.Start, hints.End, opts.Step.Milliseconds(), logicalNode.VectorSelector.LabelMatchers, logicalNode.Filters, logicalNode.ProjectionFilter, hints)
 	if logicalNode.DecodeNativeHistogramStats {
 		selector = newHistogramStatsSelector(selector)
 	}
@@ -131,8 +132,8 @@ func (p Scanners) NewMatrixSelector(
 		hints.Grouping = vs.Projection.Labels
 		hints.By = vs.Projection.Include
 	}
-
-	selector := p.selectors.GetFilteredSelector(hints.Start, hints.End, opts.Step.Milliseconds(), vs.LabelMatchers, vs.Filters, hints)
+	sort.Strings(hints.Grouping)
+	selector := p.selectors.GetSelector(hints.Start, hints.End, opts.Step.Milliseconds(), vs.LabelMatchers, vs.Filters, vs.ProjectionFilter, hints)
 	if logicalNode.VectorSelector.DecodeNativeHistogramStats {
 		selector = newHistogramStatsSelector(selector)
 	}
