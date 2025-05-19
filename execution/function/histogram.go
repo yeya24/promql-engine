@@ -91,6 +91,7 @@ func (o *histogramOperator) Series(ctx context.Context) ([]labels.Labels, error)
 		return nil, err
 	}
 
+	o.SetSeriesCount(int64(len(o.series)))
 	return o.series, nil
 }
 

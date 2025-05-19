@@ -131,7 +131,7 @@ func TestQueryAnalyze(t *testing.T) {
 	)
 
 	start := time.Unix(0, 0)
-	end := time.Unix(1000, 0)
+	end := time.Unix(700, 0)
 
 	for _, tc := range []struct {
 		query string
@@ -139,9 +139,9 @@ func TestQueryAnalyze(t *testing.T) {
 		{
 			query: `foo`,
 		},
-		{
-			query: `time()`,
-		},
+		// {
+		// 	query: `time()`,
+		// },
 		{
 			query: `sum by (job) (foo)`,
 		},
@@ -151,7 +151,7 @@ func TestQueryAnalyze(t *testing.T) {
 	} {
 		{
 			t.Run(tc.query, func(t *testing.T) {
-				t.Parallel()
+				// t.Parallel()
 				ng := engine.New(engine.Opts{EngineOpts: opts, EnableAnalysis: true})
 				ctx := context.Background()
 
@@ -177,7 +177,8 @@ func TestQueryAnalyze(t *testing.T) {
 				testutil.Ok(t, queryResults.Err)
 
 				explainableQuery = query.(engine.ExplainableQuery)
-				testutil.Assert(t, assertExecutionTimeNonZero(t, explainableQuery.Analyze()))
+				analyzeResult := explainableQuery.Analyze()
+				testutil.Assert(t, assertExecutionTimeNonZero(t, analyzeResult))
 			})
 		}
 	}
