@@ -90,12 +90,308 @@ func TestPromqlAcceptance(t *testing.T) {
 	st := &skipTest{
 		skipTests: []string{
 			"testdata/name_label_dropping.test", // feature unsupported
-			"testdata/type_and_unit.test",       // feature unsupported
 		}, // TODO(sungjin1212): change to test whole cases
 		TBRun: t,
 	}
 
 	promqltest.RunBuiltinTests(st, engine)
+}
+
+func TestTypeAndUnitBinaryOperation(t *testing.T) {
+	t.Parallel()
+
+	// A. Healthy case
+	// NOTE: __unit__"request" is not a best practice unit, but keeping that to test the unit handling.
+	load := `load 5m
+	http_requests_total{__type__="counter", __unit__="request", job="api-server", instance="0", group="production"}	0+10x10
+	http_requests_total{__type__="counter", __unit__="request", job="api-server", instance="1", group="production"}	0+20x10
+	http_requests_total{__type__="counter", __unit__="request", job="api-server", instance="0", group="canary"}	0+30x10
+	http_requests_total{__type__="counter", __unit__="request", job="api-server", instance="1", group="canary"}	0+40x10
+	http_requests_total{__type__="counter", __unit__="request", job="app-server", instance="0", group="production"}	0+50x10
+	http_requests_total{__type__="counter", __unit__="request", job="app-server", instance="1", group="production"}	0+60x10
+	http_requests_total{__type__="counter", __unit__="request", job="app-server", instance="0", group="canary"}	0+70x10
+	http_requests_total{__type__="counter", __unit__="request", job="app-server", instance="1", group="canary"}	0+80x10
+`
+
+	storage := promqltest.LoadedStorage(t, load)
+	defer storage.Close()
+
+	opts := promql.EngineOpts{
+		Logger:     promslog.NewNopLogger(),
+		Timeout:    1 * time.Hour,
+		MaxSamples: 1e10,
+	}
+	ng := engine.New(engine.Opts{EngineOpts: opts})
+
+	ctx := context.Background()
+	queryTime := time.Unix(50*60, 0) // 50 minutes
+
+	cases := []struct {
+		name     string
+		query    string
+		expected promql.Vector
+		empty    bool // true if expected to return empty result
+	}{
+		{
+			name:  "SUM(http_requests_total) BY (job)",
+			query: "SUM(http_requests_total) BY (job)",
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: 1000, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: 2600, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "SUM(http_requests_total{__type__=\"counter\", __unit__=\"request\"}) BY (job)",
+			query: `SUM(http_requests_total{__type__="counter", __unit__="request"}) BY (job)`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: 1000, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: 2600, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "SUM({__type__=\"counter\"}) BY (job)",
+			query: `SUM({__type__="counter"}) BY (job)`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: 1000, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: 2600, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "SUM({__unit__=\"request\"}) BY (job)",
+			query: `SUM({__unit__="request"}) BY (job)`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: 1000, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: 2600, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "SUM({__type__=\"counter\", __unit__=\"request\"}) BY (job)",
+			query: `SUM({__type__="counter", __unit__="request"}) BY (job)`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: 1000, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: 2600, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "SUM(http_requests_total) BY (job) - COUNT(http_requests_total) BY (job)",
+			query: "SUM(http_requests_total) BY (job) - COUNT(http_requests_total) BY (job)",
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: 996, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: 2596, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "-http_requests_total{job=\"api-server\",instance=\"0\",group=\"production\"}",
+			query: `-http_requests_total{job="api-server",instance="0",group="production"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("group", "production", "instance", "0", "job", "api-server"), F: -100, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "+http_requests_total{job=\"api-server\",instance=\"0\",group=\"production\"}",
+			query: `+http_requests_total{job="api-server",instance="0",group="production"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "production", "instance", "0", "job", "api-server"), F: 100, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "-10^3 * - SUM(http_requests_total) BY (job) ^ -1",
+			query: "-10^3 * - SUM(http_requests_total) BY (job) ^ -1",
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: 1, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: 0.38461538461538464, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "SUM(http_requests_total) BY (job) / 0",
+			query: "SUM(http_requests_total) BY (job) / 0",
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("job", "api-server"), F: math.Inf(1), T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("job", "app-server"), F: math.Inf(1), T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\", instance=\"0\", job=\"api-server\"} / 0",
+			query: `http_requests_total{group="canary", instance="0", job="api-server"} / 0`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "api-server"), F: math.Inf(1), T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "0 * http_requests_total{group=\"canary\", instance=\"0\", job=\"api-server\"} % 0",
+			query: `0 * http_requests_total{group="canary", instance="0", job="api-server"} % 0`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "api-server"), F: math.NaN(), T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{job=\"api-server\", group=\"canary\"}",
+			query: `http_requests_total{job="api-server", group="canary"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "0", "job", "api-server"), F: 300, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "api-server"), F: 400, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "rate(http_requests_total[25m]) * 25 * 60",
+			query: "rate(http_requests_total[25m]) * 25 * 60",
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "api-server"), F: 150, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "app-server"), F: 350, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "canary", "instance", "1", "job", "api-server"), F: 200, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "canary", "instance", "1", "job", "app-server"), F: 400, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "production", "instance", "0", "job", "api-server"), F: 50, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "production", "instance", "0", "job", "app-server"), F: 250.0, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "production", "instance", "1", "job", "api-server"), F: 100, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "production", "instance", "1", "job", "app-server"), F: 300, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} and http_requests_total{instance=\"0\"}",
+			query: `http_requests_total{group="canary"} and http_requests_total{instance="0"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "0", "job", "api-server"), F: 300, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "0", "job", "app-server"), F: 700, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "(http_requests_total{group=\"canary\"} + 1) and http_requests_total{instance=\"0\"}",
+			query: `(http_requests_total{group="canary"} + 1) and http_requests_total{instance="0"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "api-server"), F: 301, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "app-server"), F: 701, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} or http_requests_total{group=\"production\"}",
+			query: `http_requests_total{group="canary"} or http_requests_total{group="production"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "0", "job", "api-server"), F: 300, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "0", "job", "app-server"), F: 700, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "api-server"), F: 400, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "app-server"), F: 800, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "production", "instance", "0", "job", "api-server"), F: 100, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "production", "instance", "0", "job", "app-server"), F: 500, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "production", "instance", "1", "job", "api-server"), F: 200, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "production", "instance", "1", "job", "app-server"), F: 600, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "(http_requests_total{group=\"canary\"} + 1) or http_requests_total{instance=\"1\"}",
+			query: `(http_requests_total{group="canary"} + 1) or http_requests_total{instance="1"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "api-server"), F: 301, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "canary", "instance", "0", "job", "app-server"), F: 701, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "canary", "instance", "1", "job", "api-server"), F: 401, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("group", "canary", "instance", "1", "job", "app-server"), F: 801, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "production", "instance", "1", "job", "api-server"), F: 200, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "production", "instance", "1", "job", "app-server"), F: 600, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} unless http_requests_total{instance=\"0\"}",
+			query: `http_requests_total{group="canary"} unless http_requests_total{instance="0"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "api-server"), F: 400, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "app-server"), F: 800, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} unless on(job) http_requests_total{instance=\"0\"}",
+			query: `http_requests_total{group="canary"} unless on(job) http_requests_total{instance="0"}`,
+			empty: true,
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} unless on(job, instance) http_requests_total{instance=\"0\"}",
+			query: `http_requests_total{group="canary"} unless on(job, instance) http_requests_total{instance="0"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "api-server"), F: 400, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "app-server"), F: 800, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} / on(instance,job) http_requests_total{group=\"production\"}",
+			query: `http_requests_total{group="canary"} / on(instance,job) http_requests_total{group="production"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("instance", "0", "job", "api-server"), F: 3.0, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("instance", "0", "job", "app-server"), F: 1.4, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("instance", "1", "job", "api-server"), F: 2.0, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("instance", "1", "job", "app-server"), F: 1.3333333333333333, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} unless ignoring(group, instance) http_requests_total{instance=\"0\"}",
+			query: `http_requests_total{group="canary"} unless ignoring(group, instance) http_requests_total{instance="0"}`,
+			empty: true,
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} unless ignoring(group) http_requests_total{instance=\"0\"}",
+			query: `http_requests_total{group="canary"} unless ignoring(group) http_requests_total{instance="0"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "api-server"), F: 400, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "request", "group", "canary", "instance", "1", "job", "app-server"), F: 800, T: queryTime.UnixMilli()},
+			},
+		},
+		{
+			name:  "http_requests_total{group=\"canary\"} / ignoring(group) http_requests_total{group=\"production\"}",
+			query: `http_requests_total{group="canary"} / ignoring(group) http_requests_total{group="production"}`,
+			expected: promql.Vector{
+				{Metric: labels.FromStrings("instance", "0", "job", "api-server"), F: 3.0, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("instance", "0", "job", "app-server"), F: 1.4, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("instance", "1", "job", "api-server"), F: 2.0, T: queryTime.UnixMilli()},
+				{Metric: labels.FromStrings("instance", "1", "job", "app-server"), F: 1.3333333333333333, T: queryTime.UnixMilli()},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			qry, err := ng.NewInstantQuery(ctx, storage, nil, tc.query, queryTime)
+			testutil.Ok(t, err)
+
+			result := qry.Exec(ctx)
+			testutil.Ok(t, result.Err)
+
+			vector, err := result.Vector()
+			testutil.Ok(t, err)
+
+			if tc.empty {
+				testutil.Equals(t, promql.Vector{}, vector)
+				return
+			}
+
+			// Sort both vectors for comparison
+			sort.Slice(vector, func(i, j int) bool {
+				return labels.Compare(vector[i].Metric, vector[j].Metric) < 0
+			})
+			sort.Slice(tc.expected, func(i, j int) bool {
+				return labels.Compare(tc.expected[i].Metric, tc.expected[j].Metric) < 0
+			})
+
+			// Handle NaN and Inf comparisons specially
+			if len(vector) != len(tc.expected) {
+				t.Errorf("vector length mismatch: got %d, expected %d", len(vector), len(tc.expected))
+				return
+			}
+
+			for i := range vector {
+				if !labels.Equal(vector[i].Metric, tc.expected[i].Metric) {
+					t.Errorf("metric mismatch at index %d: got %s, expected %s", i, vector[i].Metric.String(), tc.expected[i].Metric.String())
+					continue
+				}
+				if math.IsNaN(vector[i].F) && math.IsNaN(tc.expected[i].F) {
+					continue
+				}
+				if math.IsInf(vector[i].F, 1) && math.IsInf(tc.expected[i].F, 1) {
+					continue
+				}
+				// Use approximate comparison for floating point values
+				if math.Abs(vector[i].F-tc.expected[i].F) > 1e-10 {
+					t.Errorf("value mismatch at index %d for metric %s: got %f, expected %f", i, vector[i].Metric.String(), vector[i].F, tc.expected[i].F)
+				}
+			}
+		})
+	}
 }
 
 func TestVectorSelectorWithGaps(t *testing.T) {

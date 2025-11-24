@@ -551,6 +551,17 @@ func (h *joinHelper) append(ls labels.Labels) int {
 	return h.n - 1
 }
 
+// changesMetricSchema returns true whether the op operation changes the semantic meaning or
+// schema of the metric.
+func changesMetricSchema(op parser.ItemType) bool {
+	switch op {
+	case parser.ADD, parser.SUB, parser.DIV, parser.MUL, parser.POW, parser.MOD, parser.ATAN2:
+		return true
+	default:
+		return false
+	}
+}
+
 func (o *vectorOperator) resultMetric(b *labels.Builder, highCard, lowCard labels.Labels) labels.Labels {
 	b.Reset(highCard)
 
